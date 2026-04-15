@@ -132,6 +132,20 @@ What is intentionally not done yet:
 - Multi-rank and multi-card validation.
 - Real Curvine FUSE stress validation under many small files.
 
+## Current Working Boundary
+
+The current implementation boundary is intentionally narrow:
+
+- Only implement and validate the Curvine connector path itself.
+- Keep changes focused on `curvine` connector code, its storage format, and its targeted tests.
+- Do not broaden the work into unrelated vLLM subsystems, broad shared-test refactors, or general codebase cleanup unless the Curvine connector cannot proceed without it.
+
+For CPU unit testing, the current preferred approach is also intentionally narrow:
+
+- Use a local minimal model config fixture for connector tests when possible.
+- Avoid making Curvine connector validation depend on external Hugging Face network access.
+- Treat offline connector-focused testing as the default path; only escalate to broader runtime or model-loading work when the connector logic itself requires it.
+
 ## Implementation Status
 
 The following parts are already implemented in `vllm`:
@@ -173,6 +187,127 @@ These tests currently cover:
 - Layer-scoped save and load behavior.
 - Load-side partial token scatter driven by `slot_mapping`.
 
+## How To Test
+
+The current recommended validation path has two layers.
+
+### 1. Offline connector-focused regression tests
+
+Use these first. They are the fastest way to validate the Curvine connector boundary without depending on external network access.
+
+```bash
+PYTHONPATH=. .venv/bin/python -m unittest tests/v1/kv_connector/unit/test_curvine_kvblk.py -v
+PYTHONPATH=. .venv/bin/python -m unittest tests/v1/kv_connector/unit/test_curvine_store.py -v
+PYTHONPATH=. .venv/bin/python -m unittest tests/v1/kv_connector/unit/test_curvine_connector.py -v
+```
+
+Expected result:
+
+- All three test files pass.
+- No Hugging Face network access is required for the connector test path.
+
+### 2. Manual real-vLLM validation against a local Curvine path
+
+This is the manual scenario to use when you want a real `vllm` request path instead of only unit tests.
+
+Use the following assumptions:
+
+- `Curvine` is represented by a local POSIX directory or a real Curvine FUSE mount.
+- The model path is a real local model directory that already exists on disk.
+- The CPU runtime is able to execute `LLM.generate()` successfully in your environment.
+- Both runs use the same connector config and the same storage root.
+
+First, prepare a clean local backend path:
+
+```bash
+export CURVINE_ROOT=/tmp/curvine-kv-manual
+rm -rf "$CURVINE_ROOT"
+mkdir -p "$CURVINE_ROOT"
+```
+
+Then run a first process that populates the external KV store:
+
+```bash
+PYTHONPATH=. .venv/bin/python - <<'PY'
+from vllm import LLM, SamplingParams
+from vllm.config import KVTransferConfig
+
+MODEL = "/path/to/local/model"
+PROMPT = "Curvine connector manual validation. " * 128
+
+llm = LLM(
+    model=MODEL,
+    device="cpu",
+    dtype="float32",
+    enforce_eager=True,
+    max_model_len=1024,
+    kv_transfer_config=KVTransferConfig(
+        kv_connector="CurvineKVConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "curvine_store_root": "/tmp/curvine-kv-manual",
+            "curvine_model_id": "manual-curvine-test",
+            "curvine_tp_rank": 0,
+            "curvine_kv_group_id": 0,
+        },
+    ),
+)
+
+outputs = llm.generate([PROMPT], SamplingParams(temperature=0.0, max_tokens=1))
+print(outputs[0].outputs[0].text)
+PY
+```
+
+Confirm that external KV objects were materialized:
+
+```bash
+rg --files "$CURVINE_ROOT" | rg '\.kvblk$'
+```
+
+Then run a second fresh process with the same prompt and the same connector config:
+
+```bash
+PYTHONPATH=. .venv/bin/python - <<'PY'
+from vllm import LLM, SamplingParams
+from vllm.config import KVTransferConfig
+
+MODEL = "/path/to/local/model"
+PROMPT = "Curvine connector manual validation. " * 128
+
+llm = LLM(
+    model=MODEL,
+    device="cpu",
+    dtype="float32",
+    enforce_eager=True,
+    max_model_len=1024,
+    kv_transfer_config=KVTransferConfig(
+        kv_connector="CurvineKVConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "curvine_store_root": "/tmp/curvine-kv-manual",
+            "curvine_model_id": "manual-curvine-test",
+            "curvine_tp_rank": 0,
+            "curvine_kv_group_id": 0,
+        },
+    ),
+)
+
+outputs = llm.generate([PROMPT], SamplingParams(temperature=0.0, max_tokens=1))
+print(outputs[0].outputs[0].text)
+PY
+```
+
+What to verify in this manual scenario:
+
+- The first run creates `*.kvblk` files under the configured root.
+- The second run uses the same local Curvine path and completes successfully with the same prompt shape.
+- The connector configuration stays entirely inside the Curvine path and does not require any unrelated shared connector infrastructure changes.
+
+Current limitation:
+
+- This manual `LLM.generate()` path is still gated by the CPU runtime and custom-op environment described below.
+- If the environment is missing required CPU extensions, the connector logic may already be correct while the full runtime path still fails.
+
 ## Environment Notes
 
 For lightweight Curvine connector development, the repository already contains:
@@ -188,6 +323,11 @@ pytest
 ```
 
 It is suitable for focused connector unit testing.
+
+Current practical testing guidance:
+
+- For connector-focused CPU unit tests, prefer a local minimal model config fixture instead of a remote model name.
+- This keeps Curvine validation scoped to connector behavior and avoids introducing an unnecessary external Hugging Face dependency into the PoC loop.
 
 ## Current CPU End-to-End Status
 

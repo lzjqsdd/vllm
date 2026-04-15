@@ -1,0 +1,22 @@
+{
+  "_name_or_path": "minimal-opt",
+  "architectures": [
+    "OPTForCausalLM"
+  ],
+  "bos_token_id": 0,
+  "do_layer_norm_before": true,
+  "dropout": 0.0,
+  "enable_bias": true,
+  "eos_token_id": 2,
+  "ffn_dim": 256,
+  "hidden_size": 64,
+  "init_std": 0.02,
+  "layerdrop": 0.0,
+  "max_position_embeddings": 128,
+  "model_type": "opt",
+  "num_attention_heads": 4,
+  "num_hidden_layers": 2,
+  "torch_dtype": "float16",
+  "vocab_size": 50272,
+  "word_embed_proj_dim": 64
+}

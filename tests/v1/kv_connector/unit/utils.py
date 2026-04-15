@@ -5,6 +5,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import chain, count
+from pathlib import Path
 from typing import Any, Literal
 
 import torch
@@ -45,6 +46,7 @@ from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
 EOS_TOKEN_ID = 50256
+LOCAL_TEST_MODEL = str(Path(__file__).resolve().parent / "fixtures" / "minimal_opt")
 
 
 def assert_scheduler_empty(scheduler: Scheduler):
@@ -87,7 +89,7 @@ def assert_scheduler_empty(scheduler: Scheduler):
 
 
 def create_vllm_config(
-    model: str = "facebook/opt-125m",
+    model: str = LOCAL_TEST_MODEL,
     max_num_seqs: int = 16,
     max_num_batched_tokens: int = 64,
     block_size: int = 16,
