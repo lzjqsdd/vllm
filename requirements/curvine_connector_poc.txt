@@ -1,0 +1,9 @@
+# Minimal environment for Curvine KV connector PoC tests.
+# Use this when you only need the Curvine connector Python path,
+# store tests, kvblk tests, and lightweight connector unit tests.
+
+-r common.txt
+-r kv_connectors.txt
+
+# Useful for running local unit tests directly.
+pytest
