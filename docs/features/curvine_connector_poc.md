@@ -1,199 +1,199 @@
 # Curvine Connector CPU PoC
 
-This document summarizes the current Curvine integration work for vLLM external KV storage. It is intended for contributors who need the design context, current implementation status, verification scope, and next steps in one place.
+本文总结了当前 vLLM 外部 KV 存储场景下的 Curvine 集成工作，方便后续贡献者在一个地方快速了解设计背景、当前实现状态、验证范围以及下一步计划。
 
 !!! note
-    This work is still a PoC. The goal is to validate the connector shape, storage abstraction, and block serialization format before moving to a production-grade connector.
+    当前工作仍然属于 PoC 阶段。目标是在进入生产级实现之前，先验证 connector 形态、存储抽象以及 block 序列化格式是否成立。
 
-## Background
+## 背景
 
-The current direction is to adapt Curvine as an external L2 KV store for vLLM.
+当前方向是将 Curvine 适配为 vLLM 的外部 L2 KV 存储。
 
-The agreed implementation path is:
+当前约定的实现路径如下：
 
-1. Build a PoC first, instead of starting from `OffloadingFirst`.
-2. Use `KVConnectorBase_V1` as the main integration point.
-3. Use Curvine FUSE plus POSIX file I/O first, then preserve a clean abstraction boundary so the backend can later switch to a native Curvine client.
-4. Use a stable block file format (`kvblk`) from the beginning, so storage backend changes do not affect connector semantics.
+1. 先做 PoC，而不是直接从 `OffloadingFirst` 开始。
+2. 以 `KVConnectorBase_V1` 作为主要集成入口。
+3. 先使用 Curvine FUSE 加 POSIX 文件 I/O，再保持清晰的抽象边界，方便后续把底层从 FUSE/POSIX 切换为 Curvine native client。
+4. 一开始就使用稳定的 block 文件格式（`kvblk`），这样底层存储后端变化时不会影响 connector 语义。
 
-The closest reference in vLLM is `HF3FSKVConnector`, because it already follows the external file-backed KV connector pattern.
+在 vLLM 现有实现里，最接近的参考对象是 `HF3FSKVConnector`，因为它已经采用了外部文件型 KV connector 的模式。
 
-## Design Goals
+## 设计目标
 
-The PoC only tries to prove three things:
+这个 PoC 主要验证三件事：
 
-- vLLM KV blocks can be serialized into a stable external object format.
-- The scheduler and worker connector lifecycle can drive load and save through Curvine-backed storage.
-- The same connector flow can survive a future storage backend swap from FUSE/POSIX to a native Curvine client.
+- vLLM 的 KV block 能否序列化成稳定的外部对象格式。
+- scheduler 和 worker 两侧的 connector 生命周期能否通过 Curvine 后端完成 load 和 save。
+- 当底层存储后端从 FUSE/POSIX 切换到 Curvine native client 时，connector 流程本身是否仍然成立。
 
-The PoC explicitly does not try to solve everything at once:
+这个 PoC 也明确不打算一次性解决所有问题：
 
-- No production metadata service.
-- No complex manifest layer.
-- No async transfer pipeline beyond the minimum connector lifecycle.
-- No real GPU gather and scatter path yet.
-- No multi-rank or multi-node correctness guarantees yet.
+- 不做生产级 metadata service。
+- 不做复杂 manifest 层。
+- 不做超出最小 connector 生命周期所需的异步传输流水线。
+- 暂时不做真正的 GPU gather / scatter 路径。
+- 暂时不保证多 rank / 多节点正确性。
 
-## Current Architecture
+## 当前架构
 
-The implementation is intentionally split into three layers:
+当前实现刻意拆成三层：
 
 ### `CurvineKVConnector`
 
-This is the vLLM-facing integration layer.
+这一层直接面对 vLLM。
 
-Main responsibilities:
+主要职责：
 
-- Implement `KVConnectorBase_V1`.
-- Build load and save plans from scheduler-side block state.
-- Trigger worker-side save and load operations.
-- Inject loaded payloads back into registered KV caches.
+- 实现 `KVConnectorBase_V1`。
+- 基于 scheduler 侧的 block 状态构建 load / save plan。
+- 触发 worker 侧的 save 和 load 操作。
+- 将加载回来的 payload 注入到已注册的 KV cache 中。
 
-Current implementation lives in:
+当前实现位置：
 
 - `vllm/distributed/kv_transfer/kv_connector/v1/curvine/connector.py`
 
 ### `kvblk`
 
-This is the stable block serialization format used by the PoC.
+这是 PoC 使用的稳定 block 序列化格式。
 
-Main responsibilities:
+主要职责：
 
-- Encode one logical KV block into one binary object.
-- Preserve enough header metadata for validation and future compatibility.
-- Decode bytes back into block payloads without depending on the storage backend.
+- 将一个逻辑 KV block 编码成一个二进制对象。
+- 保留足够的 header 元数据，便于校验和未来兼容。
+- 在不依赖底层存储后端的前提下，将字节流解码回 block payload。
 
-Current implementation lives in:
+当前实现位置：
 
 - `vllm/distributed/kv_transfer/kv_connector/v1/curvine/kvblk.py`
 
 ### `CurvineStoreClient`
 
-This is the storage abstraction.
+这是存储抽象层。
 
-Main responsibilities:
+主要职责：
 
-- Map `block_key` to a storage object path.
-- Support existence checks, reads, writes, and deletes.
-- Hide whether the underlying backend is POSIX/FUSE or a future native Curvine client.
+- 将 `block_key` 映射成底层存储对象路径。
+- 提供 exists、read、write、delete 等操作。
+- 屏蔽底层究竟是 POSIX/FUSE 还是未来的 Curvine native client。
 
-Current implementation lives in:
+当前实现位置：
 
 - `vllm/distributed/kv_transfer/kv_connector/v1/curvine/store.py`
 
-The current PoC backend is `PosixCurvineStoreClient`.
+当前 PoC 的后端实现是 `PosixCurvineStoreClient`。
 
-## `kvblk` V1 Format
+## `kvblk` V1 格式
 
-The current PoC stores one KV block per file and uses a fixed-size header plus raw payload bytes.
+当前 PoC 采用“一块一个文件”的方式存储 KV block，每个文件由定长 header 加原始 payload 字节组成。
 
-Important V1 properties:
+V1 格式的重要属性包括：
 
-- One file per block.
-- Fixed header length for fast validation.
-- Raw payload bytes for now.
-- CRC-based validation for header and body.
-- Layout and dtype metadata stored alongside the payload.
+- 每个 block 对应一个文件。
+- 使用定长 header，方便快速校验。
+- 当前 payload 直接存原始字节。
+- 使用 CRC 校验 header 和 body。
+- 在 payload 旁边保存 layout 和 dtype 元数据。
 
-The format is designed so that:
+这个格式的设计目标是：
 
-- `PosixCurvineStoreClient` and a future native Curvine backend can share the exact same encoded bytes.
-- Validation failures become explicit load errors instead of silent corruption.
+- `PosixCurvineStoreClient` 与未来的 Curvine native backend 可以共享完全相同的编码结果。
+- 一旦校验失败，明确报为 load error，而不是静默读到脏数据。
 
-## Current Object Layout
+## 当前对象布局
 
-The current path strategy is:
+当前路径策略如下：
 
 ```text
 <root>/<model_id>/<tp_rank>/<kv_group>/<hash_prefix>/<block_key>.kvblk
 ```
 
-This keeps object identity stable across storage backends while reducing directory hot spots.
+这样既能保持对象标识在不同后端中的稳定性，也能减少目录热点问题。
 
-## Current PoC Scope
+## 当前 PoC 范围
 
-The current PoC is CPU-first and layer-aware.
+当前 PoC 以 CPU 路径优先，并且按 layer 组织。
 
-What is already in scope:
+已经在范围内的能力：
 
-- Scheduler-side block hit detection.
-- Scheduler metadata generation for load and save.
-- Worker-side block save through `save_kv_layer`.
-- Worker-side block load through `start_load_kv` and `wait_for_layer_load`.
-- CPU tensor serialization and deserialization.
-- Layer-scoped storage keys.
-- Slot-mapping-aware load-side partial token scatter.
+- scheduler 侧 block 命中检测。
+- scheduler 侧 load / save metadata 生成。
+- worker 侧通过 `save_kv_layer` 保存 block。
+- worker 侧通过 `start_load_kv` 和 `wait_for_layer_load` 加载 block。
+- CPU tensor 的序列化与反序列化。
+- 按 layer 隔离的存储 key。
+- load 侧根据 `slot_mapping` 进行部分 token scatter。
 
-What is intentionally not done yet:
+暂时有意不做的能力：
 
-- Save-side real partial-token gather from scattered slots.
-- Real GPU gather and scatter.
-- Full async save completion semantics in `wait_for_save()` and `get_finished()`.
-- Multi-rank and multi-card validation.
-- Real Curvine FUSE stress validation under many small files.
+- save 侧从离散 slot 中真正做 partial-token gather。
+- 真正的 GPU gather / scatter。
+- `wait_for_save()` 和 `get_finished()` 上完整的异步保存完成语义。
+- 多 rank / 多卡验证。
+- 面向大量小文件的真实 Curvine FUSE 压测。
 
-## Current Working Boundary
+## 当前工作边界
 
-The current implementation boundary is intentionally narrow:
+当前实现边界被刻意收得很窄：
 
-- Only implement and validate the Curvine connector path itself.
-- Keep changes focused on `curvine` connector code, its storage format, and its targeted tests.
-- Do not broaden the work into unrelated vLLM subsystems, broad shared-test refactors, or general codebase cleanup unless the Curvine connector cannot proceed without it.
+- 只实现和验证 Curvine connector 这条路径本身。
+- 变更尽量只聚焦 `curvine` connector 代码、它的存储格式以及定向测试。
+- 除非 Curvine connector 自身无法推进，否则不要把工作扩展到无关的 vLLM 子系统、泛化的 shared-test 重构，或者整体代码清理。
 
-For CPU unit testing, the current preferred approach is also intentionally narrow:
+对于 CPU 单元测试，当前推荐路径也同样保持收敛：
 
-- Use a local minimal model config fixture for connector tests when possible.
-- Avoid making Curvine connector validation depend on external Hugging Face network access.
-- Treat offline connector-focused testing as the default path; only escalate to broader runtime or model-loading work when the connector logic itself requires it.
+- 尽量使用本地最小 model config fixture 来支撑 connector 测试。
+- 避免让 Curvine connector 的验证依赖外部 Hugging Face 网络访问。
+- 默认优先走离线、connector 聚焦的测试路径；只有当 connector 逻辑本身确实要求时，才升级到更宽的 runtime 或 model-loading 范围。
 
-## Implementation Status
+## 实现状态
 
-The following parts are already implemented in `vllm`:
+`vllm` 中已经实现的部分包括：
 
-- `CurvineKVConnector` is registered in the connector factory.
-- `CurvineRequestMetadata` and `CurvineConnectorMetadata` carry per-request load and save plans.
-- `save_kv_layer()` can persist raw payloads and CPU tensors as `kvblk`.
-- `start_load_kv()` builds per-layer pending load queues.
-- `wait_for_layer_load(layer_name)` performs deferred per-layer injection.
-- Store keys are layer-scoped, preventing collisions between layers for the same logical block key.
-- Corrupted `kvblk` objects are treated as load failures.
+- `CurvineKVConnector` 已注册进 connector factory。
+- `CurvineRequestMetadata` 和 `CurvineConnectorMetadata` 可以承载每个请求的 load / save plan。
+- `save_kv_layer()` 已支持把原始 payload 和 CPU tensor 持久化为 `kvblk`。
+- `start_load_kv()` 已能构建按 layer 组织的待加载队列。
+- `wait_for_layer_load(layer_name)` 已能执行延迟的按层注入。
+- store key 已按 layer 隔离，避免同一逻辑 block key 在不同 layer 上冲突。
+- 损坏的 `kvblk` 对象会被当作 load failure 处理。
 
-The CPU path has already progressed beyond simple bytes round-trips:
+CPU 路径已经不止停留在简单的 bytes round-trip：
 
-- Full block extraction from CPU KV tensors is implemented.
-- Full block reinjection into registered CPU KV caches is implemented.
-- `ForwardContext.slot_mapping[layer_name]` is consumed on the load path.
-- If only some tokens of a block are requested, the current PoC only scatters those tokens back instead of overwriting the entire block.
-- If save-side `slot_mapping` only covers part of a block, the current PoC skips persistence to avoid writing partial or dirty blocks.
+- 已支持从 CPU KV tensor 中完整提取 block。
+- 已支持把 block 完整注入回已注册的 CPU KV cache。
+- load 路径已经消费 `ForwardContext.slot_mapping[layer_name]`。
+- 如果一次只请求某个 block 的部分 token，当前 PoC 只会把这些 token scatter 回去，而不会覆盖整个 block。
+- 如果 save 侧的 `slot_mapping` 只覆盖了一个 block 的部分内容，当前 PoC 会跳过持久化，避免写入局部或脏 block。
 
-## Current Tests
+## 当前测试
 
-The current Curvine PoC work is covered by focused unit tests:
+当前 Curvine PoC 由以下定向单元测试覆盖：
 
 - `tests/v1/kv_connector/unit/test_curvine_kvblk.py`
 - `tests/v1/kv_connector/unit/test_curvine_store.py`
 - `tests/v1/kv_connector/unit/test_curvine_connector.py`
 
-These tests currently cover:
+这些测试当前覆盖了：
 
-- `kvblk` header and encode/decode behavior.
-- Store path mapping and POSIX read/write behavior.
-- Connector factory registration.
-- Scheduler-side matched block counting.
-- Scheduler-side load and save metadata generation.
-- Worker-side save and load through metadata.
-- CPU tensor block extraction and reinjection.
-- Corrupted block handling.
-- Layer-scoped save and load behavior.
-- Load-side partial token scatter driven by `slot_mapping`.
+- `kvblk` header 以及 encode / decode 行为。
+- store 路径映射与 POSIX 读写行为。
+- connector factory 注册。
+- scheduler 侧匹配 block 计数。
+- scheduler 侧 load / save metadata 生成。
+- worker 侧通过 metadata 执行 save / load。
+- CPU tensor block 提取与回灌。
+- 损坏 block 的处理。
+- 按 layer 隔离的 save / load 行为。
+- 基于 `slot_mapping` 的 load 侧部分 token scatter。
 
-## How To Test
+## 如何测试
 
-The current recommended validation path has two layers.
+当前推荐的验证路径分为两层。
 
-### 1. Offline connector-focused regression tests
+### 1. 离线、connector 聚焦的回归测试
 
-Use these first. They are the fastest way to validate the Curvine connector boundary without depending on external network access.
+建议先跑这一层。这是验证 Curvine connector 边界最快的方式，而且不依赖外部网络。
 
 ```bash
 PYTHONPATH=. .venv/bin/python -m unittest tests/v1/kv_connector/unit/test_curvine_kvblk.py -v
@@ -201,23 +201,23 @@ PYTHONPATH=. .venv/bin/python -m unittest tests/v1/kv_connector/unit/test_curvin
 PYTHONPATH=. .venv/bin/python -m unittest tests/v1/kv_connector/unit/test_curvine_connector.py -v
 ```
 
-Expected result:
+预期结果：
 
-- All three test files pass.
-- No Hugging Face network access is required for the connector test path.
+- 三个测试文件全部通过。
+- connector 测试路径不需要访问 Hugging Face 网络。
 
-### 2. Manual real-vLLM validation against a local Curvine path
+### 2. 面向本地 Curvine 路径的真实 vLLM 手动验证
 
-This is the manual scenario to use when you want a real `vllm` request path instead of only unit tests.
+如果你要验证真实的 `vllm` 请求路径，而不是只看单元测试，就用这一层。
 
-Use the following assumptions:
+使用前提如下：
 
-- `Curvine` is represented by a local POSIX directory or a real Curvine FUSE mount.
-- The model path is a real local model directory that already exists on disk.
-- The CPU runtime is able to execute `LLM.generate()` successfully in your environment.
-- Both runs use the same connector config and the same storage root.
+- `Curvine` 当前用本地 POSIX 目录或者真实 Curvine FUSE 挂载点来表示。
+- model path 是本地已存在的真实模型目录。
+- 你的 CPU runtime 环境已经可以成功执行 `LLM.generate()`。
+- 两次运行使用相同的 connector 配置和相同的存储根目录。
 
-First, prepare a clean local backend path:
+首先，准备一个干净的本地后端路径：
 
 ```bash
 export CURVINE_ROOT=/tmp/curvine-kv-manual
@@ -225,7 +225,7 @@ rm -rf "$CURVINE_ROOT"
 mkdir -p "$CURVINE_ROOT"
 ```
 
-Then run a first process that populates the external KV store:
+然后运行第一个进程，把外部 KV 存储写出来：
 
 ```bash
 PYTHONPATH=. .venv/bin/python - <<'PY'
@@ -258,13 +258,13 @@ print(outputs[0].outputs[0].text)
 PY
 ```
 
-Confirm that external KV objects were materialized:
+确认外部 KV 对象已经落盘：
 
 ```bash
 rg --files "$CURVINE_ROOT" | rg '\.kvblk$'
 ```
 
-Then run a second fresh process with the same prompt and the same connector config:
+然后在一个新的进程里，用同样的 prompt 和同样的 connector 配置再次运行：
 
 ```bash
 PYTHONPATH=. .venv/bin/python - <<'PY'
@@ -297,24 +297,24 @@ print(outputs[0].outputs[0].text)
 PY
 ```
 
-What to verify in this manual scenario:
+这个手动场景里建议确认以下几点：
 
-- The first run creates `*.kvblk` files under the configured root.
-- The second run uses the same local Curvine path and completes successfully with the same prompt shape.
-- The connector configuration stays entirely inside the Curvine path and does not require any unrelated shared connector infrastructure changes.
+- 第一次运行后，会在配置的根目录下生成 `*.kvblk` 文件。
+- 第二次运行使用同一份本地 Curvine 路径，并且在相同 prompt 形状下成功完成。
+- connector 配置始终限制在 Curvine 这条路径内部，不需要引入无关的共享 connector 基础设施改动。
 
-Current limitation:
+当前限制：
 
-- This manual `LLM.generate()` path is still gated by the CPU runtime and custom-op environment described below.
-- If the environment is missing required CPU extensions, the connector logic may already be correct while the full runtime path still fails.
+- 这条手动 `LLM.generate()` 路径仍然受下面提到的 CPU runtime 和 custom-op 环境约束。
+- 如果环境缺少必需的 CPU extension，可能 connector 逻辑本身已经正确，但完整 runtime 路径仍然会失败。
 
-## Environment Notes
+## 环境说明
 
-For lightweight Curvine connector development, the repository already contains:
+为了支持轻量级 Curvine connector 开发，仓库中已经提供：
 
 - `requirements/curvine_connector_poc.txt`
 
-This file includes:
+内容如下：
 
 ```text
 -r common.txt
@@ -322,63 +322,63 @@ This file includes:
 pytest
 ```
 
-It is suitable for focused connector unit testing.
+它适合用来跑聚焦于 connector 的单元测试。
 
-Current practical testing guidance:
+当前更实用的测试建议如下：
 
-- For connector-focused CPU unit tests, prefer a local minimal model config fixture instead of a remote model name.
-- This keeps Curvine validation scoped to connector behavior and avoids introducing an unnecessary external Hugging Face dependency into the PoC loop.
+- 对于 connector 聚焦的 CPU 单测，优先使用本地最小 model config fixture，而不是远程模型名。
+- 这样可以把 Curvine 的验证严格限制在 connector 行为本身，避免在 PoC 循环里引入额外的 Hugging Face 外部依赖。
 
-## Current CPU End-to-End Status
+## 当前 CPU 端到端状态
 
-There are two distinct CPU validation layers:
+目前有两层 CPU 验证路径：
 
-### 1. Connector-focused CPU tests
+### 1. Connector 聚焦的 CPU 测试
 
-This layer is already working and is the main source of confidence for the PoC today.
+这一层已经跑通，也是当前 PoC 可信度的主要来源。
 
-### 2. Full `LLM.generate()` CPU end-to-end validation
+### 2. 完整 `LLM.generate()` 的 CPU 端到端验证
 
-This is not fully closed yet in the current workspace.
+这一层在当前工作区里还没有完全闭环。
 
-The latest environment investigation found:
+最近一次环境排查得到的结论是：
 
-- A precompiled CPU-flavored editable install can start the CPU engine, load the model, and reach execution.
-- However, it is still missing compiled custom ops needed by the runtime path, such as `torch.ops._C.compute_slot_mapping_kernel_impl`.
-- Switching to a full source CPU build also requires the Python environment to use a CPU build of PyTorch and a non-isolated build path that compiles vLLM custom CPU extensions successfully.
+- 使用预编译的 CPU 风格 editable install，已经可以启动 CPU engine、加载模型并进入执行阶段。
+- 但 runtime 路径仍然缺少一些已编译 custom ops，例如 `torch.ops._C.compute_slot_mapping_kernel_impl`。
+- 如果切换成完整源码 CPU 构建，则还要求 Python 环境使用 CPU 版 PyTorch，并通过非隔离的构建路径成功编译 vLLM 的 CPU 自定义扩展。
 
-This means the remaining CPU end-to-end gap is now mainly an environment and compiled-extension issue, not a gap in the Curvine connector Python logic itself.
+这意味着当前剩余的 CPU 端到端缺口，主要已经是环境和编译扩展问题，而不是 Curvine connector 的 Python 逻辑缺失。
 
-## Risks
+## 风险
 
-Current high-risk areas are:
+当前高风险点包括：
 
-- FUSE latency under many small KV block files.
-- Mismatch between serialized canonical layout and runtime KV layout.
-- Incorrect `block_key` semantics causing false hits or missed hits.
-- Metadata pressure from one-file-per-block storage.
-- Save-side partial block handling still being conservative.
+- 大量小 KV block 文件带来的 FUSE 延迟。
+- 序列化后的 canonical layout 与运行时 KV layout 不一致。
+- `block_key` 语义错误导致误命中或漏命中。
+- 一块一文件带来的 metadata 压力。
+- save 侧对 partial block 的处理仍然偏保守。
 
-Current mitigations are:
+当前缓解手段包括：
 
-- `kvblk` validation on load.
-- Clean `CurvineStoreClient` boundary.
-- CPU-first narrowing of runtime semantics before GPU integration.
-- Focused tests around layer-scoped and slot-aware behavior.
+- load 侧做 `kvblk` 校验。
+- 保持清晰的 `CurvineStoreClient` 抽象边界。
+- 先在 CPU 路径上把运行时语义收敛清楚，再进入 GPU 集成。
+- 用定向测试覆盖按 layer 与按 slot 的关键行为。
 
-## Next Steps
+## 下一步
 
-The current execution order should be:
+当前建议的执行顺序如下：
 
-1. Finish save-side partial-token gather on CPU.
-2. Close the full CPU `LLM.generate()` end-to-end path by fixing the CPU build and custom op environment.
-3. Run a true Curvine-backed CPU PoC with real requests.
-4. Port the worker path from CPU-only semantics to real GPU gather and scatter.
-5. Validate multi-rank and stress scenarios.
+1. 完成 CPU 路径上的 save 侧 partial-token gather。
+2. 通过修复 CPU build 和 custom op 环境，打通完整的 CPU `LLM.generate()` 端到端路径。
+3. 用真实请求跑通真正的 Curvine-backed CPU PoC。
+4. 将 worker 路径从 CPU-only 语义扩展到真正的 GPU gather / scatter。
+5. 验证多 rank 与压测场景。
 
-## Quick Contributor Map
+## 快速贡献者地图
 
-If you need to continue this work, start from these files:
+如果你要继续这项工作，建议从以下文件开始：
 
 - `vllm/distributed/kv_transfer/kv_connector/v1/curvine/connector.py`
 - `vllm/distributed/kv_transfer/kv_connector/v1/curvine/kvblk.py`
@@ -388,4 +388,4 @@ If you need to continue this work, start from these files:
 - `tests/v1/kv_connector/unit/test_curvine_store.py`
 - `requirements/curvine_connector_poc.txt`
 
-For the original broader design context that led to this PoC, refer to the Curvine-side design notes and then sync any contributor-facing updates back into this document.
+如果需要追溯最初推动这个 PoC 的更宽设计背景，可以先看 Curvine 侧设计说明，再把面向贡献者的最新结论同步回本文档。
