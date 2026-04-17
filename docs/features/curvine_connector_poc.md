@@ -288,6 +288,9 @@ PYTHONPATH=. .venv/bin/python -m unittest tests/v1/kv_connector/unit/test_curvin
 - 两次运行使用相同的 connector 配置和相同的存储根目录。
 - 为了验证“外部 Curvine 命中”而不是“同进程内 prefix cache 命中”，第二次验证必须放在一个全新的 Python 进程里执行。
 - 不要使用 `python - <<'PY'` 这类 heredoc / stdin 方式执行。vLLM 在当前 CPU worker 启动路径下会把主程序识别为 `<stdin>`，导致子进程启动失败。请始终使用一个真实的 `.py` 文件路径执行。
+- 两次运行都要固定 `PYTHONHASHSEED`。当前 block hash 的首块种子会受它影响；如果不固定，同一个 prompt 在两个新进程里可能得到不同的 block key，导致外部 KV 无法复用。
+- 如果你在 CPU 上使用 `load_format="dummy"` 做链路验证，示例模型必须满足 `CPU_ATTN` 支持的 head size 约束。像仓库里的 `tests/v1/kv_connector/unit/fixtures/minimal_opt` 这种 `hidden_size=64, num_attention_heads=4` 的配置，`head_dim=16`，不适合作为真实 CPU 推理链路验证模型。
+- 当前这条真实 CPU 路径里，runtime `cache_block_size` 实测是 `128`。因此第一次保存前，prompt 至少要覆盖一个完整 block；如果 prompt 只有 `64` token，就不会生成 `block_hashes`，也不会触发外部 save。
 
 首先，准备一个干净的本地后端路径：
 
@@ -304,8 +307,8 @@ from vllm import LLM, SamplingParams, TokensPrompt
 from vllm.config import KVTransferConfig
 
 
-MODEL = "/root/codespace/barry/codespace/vllm/tests/v1/kv_connector/unit/fixtures/minimal_opt"
-PROMPT_IDS = list(range(64))
+MODEL = "/path/to/local/minimal_opt_cpu_supported"
+PROMPT_IDS = list(range(128))
 
 
 def build_llm() -> LLM:
@@ -315,7 +318,7 @@ def build_llm() -> LLM:
         skip_tokenizer_init=True,
         dtype="float32",
         enforce_eager=True,
-        max_model_len=128,
+        max_model_len=256,
         distributed_executor_backend="uni",
         kv_transfer_config=KVTransferConfig(
             kv_connector="CurvineKVConnector",
@@ -347,14 +350,54 @@ if __name__ == "__main__":
     main()
 ```
 
+其中这个本地 dummy model 至少要满足：
+
+- `hidden_size / num_attention_heads` 落在 CPU_ATTN 支持范围内，例如 `128 / 4 = 32`
+- `max_position_embeddings >= 128`
+- `max_model_len >= 128`
+
 然后运行第一个进程，把外部 KV 存储写出来：
 
 ```bash
+PYTHONHASHSEED=0 \
 VLLM_TARGET_DEVICE=cpu \
 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
 PYTHONPATH=. \
 .venv/bin/python /tmp/manual_curvine_llm.py
 ```
+
+#### 本工作区真实测试记录（2026-04-17）
+
+已在当前工作区按上面的真实 `.py` 文件入口做了多轮实际排查和实测，结论按时间顺序如下：
+
+1. 第一轮失败点不是 Curvine 本身，而是 CPU runtime 环境：
+   - `LLM.generate()` 已经成功进入 engine 初始化、worker 启动、模型 warmup 和 `CurvineKVConnector` 创建阶段。
+   - 随后在 CPU runtime 的 slot mapping custom op 处失败，报错为 `AttributeError: '_OpNamespace' '_C' object has no attribute 'compute_slot_mapping_kernel_impl'`。
+   - 这时 `hasattr(torch.ops._C, "compute_slot_mapping_kernel_impl")` 返回 `False`，因此第一次实测没有生成 `*.kvblk` 文件。
+
+2. 补齐 CPU custom op 之后，又暴露了第二层环境问题：
+   - vLLM 必须做 CPU 目标的 editable 安装，确保 CPU custom op 和 ISA 对应的扩展都实际编译并注册成功。
+   - `torchvision` / `torchaudio` 也必须使用 CPU 版本，否则会在 runtime 路径里因为错误链接到 CUDA 轮子而失败。
+
+3. 环境修好后，真实链路第一次还能继续往下走，但又踩到两个“验证配置”问题：
+   - `tests/v1/kv_connector/unit/fixtures/minimal_opt` 这个 fixture 的 `head_dim=16`，不满足 `CPU_ATTN` 支持范围，所以不能直接拿来做真实 CPU 推理验证。
+   - 当前 runtime `cache_block_size` 实测是 `128`，原先 `64` token 的 prompt 凑不出完整 block，因此 `request.block_hashes` 为空，不会产生 save metadata，也不会落盘任何外部 KV。
+
+4. 把 dummy model 改成 CPU 可执行配置，并把 prompt 提到 `128` token 之后：
+   - scheduler 侧已经能真实生成 `save` metadata；
+   - `request.block_hashes` 实测为 `1`；
+   - 本地 Curvine 目录下真实写出了两份 `*.kvblk` 文件（对应两层 self attention）。
+
+5. 继续做第二个全新进程验证时，又发现一个当前 PoC 的真实功能问题：
+   - 如果 `PYTHONHASHSEED` 不固定，同一个 prompt 在两个新进程里会生成不同的 block key；
+   - 即使固定了 `PYTHONHASHSEED=0`，第二个新进程的 scheduler 仍然生成的是 `save` 而不是 `load`；
+   - 进一步排查确认：当前 Curvine connector 的 save 路径使用了 layer-scoped key，而 scheduler 的存在性检查仍然查 raw block key，导致磁盘文件已经存在，第二个新进程仍判断“未命中”。
+
+因此，本工作区到 2026-04-17 的真实结论是：
+
+- CPU 运行环境问题已经定位并修通；
+- 真实 save 路径已经打通，能够落盘 `*.kvblk`；
+- 真实跨进程 load 命中当前仍未打通，剩余问题是 Curvine connector 自身的 key 一致性 bug，而不是环境问题。
 
 确认外部 KV 对象已经落盘：
 
@@ -365,6 +408,7 @@ rg --files "$CURVINE_ROOT" | rg '\.kvblk$'
 然后在一个新的进程里，用同样的脚本和同样的 connector 配置再次运行：
 
 ```bash
+PYTHONHASHSEED=0 \
 VLLM_TARGET_DEVICE=cpu \
 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
 PYTHONPATH=. \
@@ -378,6 +422,8 @@ PYTHONPATH=. \
 - 第一轮运行的 `num_cached_tokens` 预期是 `0` 或接近 `0`。
 - 第二轮运行如果真正命中了外部 Curvine 前缀，`num_cached_tokens` 应该明显大于 `0`。
 - connector 配置始终限制在 Curvine 这条路径内部，不需要引入无关的共享 connector 基础设施改动。
+
+注意：截至当前工作区实测，前四条都已经验证过，但“第二轮外部命中”这一条还会被当前 Curvine connector 的 key 一致性问题挡住。也就是说，现在你可以把“首次真实 save 是否成功”与“跨进程真实 load 是否成功”拆成两个阶段分别判断，不要把它们混成一个问题。
 
 如果你已经有真实本地模型目录，也可以把上面的示例替换成真实模型路径，并去掉：
 
@@ -445,63 +491,68 @@ PYTHONPATH=. \
 
 ### 常见失败与排查方法
 
-如果你在手动验证中遇到下面这些报错：
+如果你在手动验证中遇到失败，推荐按下面这个顺序排查，不要一上来就改 connector 逻辑：
 
-- `ImportError('libcudart.so.12: cannot open shared object file')`
+#### 第一类：CPU runtime / 安装环境问题
+
+典型现象：
+
+- `ImportError('libcudart.so.*: cannot open shared object file')`
 - `torch.ops._C.compute_slot_mapping_kernel_impl` 不存在
+- `torchvision::nms does not exist`
 
-那说明当前失败点已经不是 Curvine 路径或 connector 配置，而是 vLLM 的 CPU build / custom-op 环境。
+这说明当前失败点还在 vLLM 的 CPU build 或 PyTorch 依赖环境，不在 Curvine connector。
 
-推荐排查顺序如下：
+推荐处理顺序：
 
-1. 先卸载现有的 `vllm`
-2. 用 CPU 目标重新做源码 editable 安装
-3. 安装时不要继续依赖预编译 CPU wheel
-4. 安装完成后先验证 `vllm._C` 与 `compute_slot_mapping_kernel_impl` 是否可用
-5. 只有这一步通过后，再回到 Curvine 手动验证
+1. 确认当前环境里的 `vllm` 是 CPU 目标的 editable 安装，而不是只靠 `PYTHONPATH=.` 去碰源码目录。
+2. 重新用 CPU 目标安装 `vllm`，确保 `vllm._C` 和 ISA 对应的 CPU 扩展都被正确编译、安装并注册。
+3. 检查 `torchvision` / `torchaudio` 是否装成了 CPU 版本，避免误装 CUDA 轮子。
+4. 先验证 `vllm._C` 和 `compute_slot_mapping_kernel_impl` 可用，再回到 Curvine 手动验证。
 
 推荐命令：
 
 ```bash
-cd /root/codespace/barry/codespace/vllm
-
-VLLM_TARGET_DEVICE=cpu /root/.local/bin/uv pip uninstall -y vllm
-
-VLLM_TARGET_DEVICE=cpu /root/.local/bin/uv pip install -e . --torch-backend=auto --no-build-isolation
+VLLM_TARGET_DEVICE=cpu UV_TORCH_BACKEND=cpu \
+uv pip install --python .venv/bin/python -e . --no-build-isolation
 ```
 
-安装完成后，先做环境自检：
-
-```bash
-VLLM_TARGET_DEVICE=cpu PYTHONPATH=. .venv/bin/python - <<'PY'
-import torch
-import vllm
-from vllm.platforms import current_platform
-from importlib.metadata import version
-
-print("vllm_version =", version("vllm"))
-print("current_platform =", type(current_platform).__name__, current_platform.device_type)
-
-try:
-    import vllm._C
-    print("import vllm._C = ok")
-except Exception as e:
-    print("import vllm._C = failed:", repr(e))
-
-print(
-    "has compute_slot_mapping_kernel_impl =",
-    hasattr(torch.ops._C, "compute_slot_mapping_kernel_impl"),
-)
-PY
-```
-
-预期至少要满足：
+环境自检建议写成一个真实 `.py` 文件再执行，避免再次踩 `<stdin>` 启动路径的问题。预期至少要满足：
 
 - `current_platform = CpuPlatform cpu`
 - `import vllm._C = ok`
 - `has compute_slot_mapping_kernel_impl = True`
 
 只要第三条还是 `False`，就不要继续判断 Curvine 是否命中，因为真实推理路径还会在 CPU custom op 处失败。
+
+#### 第二类：验证输入本身不满足真实 save 条件
+
+典型现象：
+
+- `Unsupported CPU attention configuration: head_dim=16 isa=...`
+- 第一次运行能结束，但没有任何 `*.kvblk` 文件生成
+- scheduler 里 `request.block_hashes` 长度一直是 `0`
+
+这通常不是 Curvine 保存逻辑坏了，而是输入没有满足 runtime 的基本条件：
+
+1. dummy model 的 `head_dim` 必须是 CPU_ATTN 支持值，例如 `32`。
+2. prompt 长度必须至少覆盖一个完整 block；当前这条路径里实测 block size 是 `128`。
+3. `max_position_embeddings` 和 `max_model_len` 也要跟着调大，不能还停在 `128` 以下。
+
+#### 第三类：首次 save 成功，但第二个新进程仍然不命中
+
+典型现象：
+
+1. 第一次运行已经写出 `*.kvblk`
+2. 第二次使用同一目录、同一 prompt、同一配置
+3. `num_cached_tokens` 仍然是 `0`
+
+这时建议继续分两步看：
+
+1. 先固定 `PYTHONHASHSEED`，排除跨进程 block key 不稳定。
+2. 再看第二个进程 scheduler 产出的 metadata 是 `load` 还是 `save`。
+
+如果文件已经在、`PYTHONHASHSEED` 也固定了，但第二个进程的 metadata 还是 `save`，那就说明剩余问题已经落在 connector 自身的 key 读取/写入一致性，而不是环境或手动验证姿势。
 
 ## 环境说明
 
