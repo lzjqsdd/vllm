@@ -529,6 +529,51 @@ PYTHONPATH=. \
 3. 检查 `torchvision` / `torchaudio` 是否装成了 CPU 版本，避免误装 CUDA 轮子。
 4. 先验证 `vllm._C` 和 `compute_slot_mapping_kernel_impl` 可用，再回到 Curvine 手动验证。
 
+推荐的 CPU 版安装流程如下：
+
+```bash
+# 1) Create or refresh the virtual environment.
+uv venv --python 3.12
+
+# 2) Install lint and pre-commit dependencies used by the repo.
+uv pip install --python .venv/bin/python -r requirements/lint.txt
+pre-commit install
+
+# 3) Install vLLM as a CPU-target editable build.
+VLLM_TARGET_DEVICE=cpu UV_TORCH_BACKEND=cpu \
+uv pip install --python .venv/bin/python -e . --no-build-isolation
+```
+
+如果你之前这个环境里装过 GPU 版依赖，或者已经见过下面这些错误：
+
+- `ImportError('libcudart.so.*: cannot open shared object file')`
+- `torchvision::nms does not exist`
+
+那建议把 `torchvision` / `torchaudio` 明确重装成 CPU 轮子：
+
+```bash
+uv pip install --python .venv/bin/python \
+  --reinstall-package torchvision \
+  --reinstall-package torchaudio \
+  --default-index https://download.pytorch.org/whl/cpu \
+  --index https://pypi.org/simple \
+  --index-strategy unsafe-best-match \
+  torchvision torchaudio
+```
+
+如果你还要跑仓库里的测试，再补测试依赖：
+
+```bash
+uv pip install --python .venv/bin/python -r requirements/test/cuda.in
+```
+
+安装完成后，建议先确认下面这些文件或模块已经就位：
+
+- `vllm._C`
+- `vllm._C_AVX2`
+- `vllm._C_AVX512`
+- `torch.ops._C.compute_slot_mapping_kernel_impl`
+
 推荐命令：
 
 ```bash
@@ -536,10 +581,42 @@ VLLM_TARGET_DEVICE=cpu UV_TORCH_BACKEND=cpu \
 uv pip install --python .venv/bin/python -e . --no-build-isolation
 ```
 
-环境自检建议写成一个真实 `.py` 文件再执行，避免再次踩 `<stdin>` 启动路径的问题。预期至少要满足：
+环境自检建议写成一个真实 `.py` 文件再执行，避免再次踩 `<stdin>` 启动路径的问题。例如：
+
+```python
+from importlib.metadata import version
+
+import torch
+import vllm
+from vllm.platforms import current_platform
+
+print("vllm_version =", version("vllm"))
+print("current_platform =", type(current_platform).__name__, current_platform.device_type)
+
+try:
+    import vllm._C
+    print("import vllm._C = ok")
+except Exception as err:
+    print("import vllm._C = failed:", repr(err))
+
+for module_name in ("vllm._C_AVX2", "vllm._C_AVX512"):
+    try:
+        __import__(module_name)
+        print(f"import {module_name} = ok")
+    except Exception as err:
+        print(f"import {module_name} = failed:", repr(err))
+
+print(
+    "has compute_slot_mapping_kernel_impl =",
+    hasattr(torch.ops._C, "compute_slot_mapping_kernel_impl"),
+)
+```
+
+预期至少要满足：
 
 - `current_platform = CpuPlatform cpu`
 - `import vllm._C = ok`
+- `import vllm._C_AVX2 = ok` 或者 `import vllm._C_AVX512 = ok`
 - `has compute_slot_mapping_kernel_impl = True`
 
 只要第三条还是 `False`，就不要继续判断 Curvine 是否命中，因为真实推理路径还会在 CPU custom op 处失败。
