@@ -110,6 +110,76 @@ V1 格式的重要属性包括：
 
 这样既能保持对象标识在不同后端中的稳定性，也能减少目录热点问题。
 
+## 基础概念
+
+为了方便看懂对象路径、header 字段和命中逻辑，这里先统一几个基础概念。
+
+### `model_id`
+
+- 表示当前这份外部 KV 数据属于哪个模型。
+- 在当前 PoC 里，它会参与目录隔离，也会写进 `kvblk` header 的模型相关字段。
+- 如果两个不同模型共用同一份外部路径，但 `model_id` 不同，它们的数据会自然隔离。
+
+### `tp_rank`
+
+- `tp_rank` 是 `Tensor Parallel Rank`，也就是 tensor parallel 切分后当前分片的编号。
+- 如果模型没有做 tensor parallel，通常它就是 `0`。
+- 如果模型被切成多份，比如 `tp_size=2`，那通常就会有 `tp_rank=0` 和 `tp_rank=1` 两个分片。
+- 当前 PoC 把它放进目录路径和 `kvblk` header，目的是把不同 TP 分片的 KV 数据隔离开，避免互相覆盖。
+
+可以把它理解成：
+
+- `tp_rank=0`：第 0 份张量并行分片的数据
+- `tp_rank=1`：第 1 份张量并行分片的数据
+
+### `kv_group_id`
+
+- `kv_group_id` 表示当前 KV 数据属于哪个 KV group。
+- 在当前单卡、单组的 CPU PoC 里，它通常直接取 `0`。
+- 后续如果一个模型运行时存在多个 KV cache group，就需要依赖它来继续做隔离。
+
+### `block_key`
+
+- `block_key` 是一个逻辑 KV block 的稳定标识。
+- 当前实现里，它来自请求 block hash 的十六进制表示。
+- 同一个 prompt 前缀在相同模型、相同布局、相同语义下，只要算出的 block hash 一样，对应的 `block_key` 就一样。
+- 这也是外部存储命中的基础。
+
+### `slot_mapping`
+
+- `slot_mapping` 描述“本次真正需要写入或回填的是哪些 slot / token 位置”。
+- 当前 PoC 在 load 路径上已经会利用它做部分 token scatter。
+- save 路径上如果只覆盖了一个 block 的一部分 token，当前实现会保守地跳过持久化，避免写出不完整 block。
+
+## 当前命中判定逻辑
+
+当前 `Curvine` PoC 的“命中”不是靠复杂索引服务，而是靠一个非常直接的规则：
+
+1. 先根据请求 prompt 计算出完整 block 的 `block_key` 列表。
+2. 对这些 `block_key` 到外部存储做 `batch_exists()` 检查。
+3. 从前往后统计“连续存在”的 block。
+4. 一旦遇到第一个不存在的 block，就停止统计。
+5. 把这段连续命中的前缀 block 作为可加载的外部 KV。
+
+换句话说，当前命中语义是：
+
+- 只看前缀连续命中。
+- 不做“中间断了后面还能继续命中”的稀疏加载。
+- 命中的本质依据就是：对应的外部 `kvblk` 文件已经存在。
+
+从实现上看，核心逻辑就在 `CurvineKVConnector.get_num_new_matched_tokens()`：
+
+- 它先计算 prompt 能组成多少个完整 block。
+- 再把 block hash 转成 `block_key`。
+- 然后对外部存储做存在性检查。
+- 最后把“连续命中的 block 数 * block_size”作为 `matched_tokens` 返回给 scheduler。
+
+这也意味着当前最基础、最可靠的命中前提是：
+
+- 第二次请求的 prompt 前缀必须与第一次一致。
+- 两次运行必须使用同一个 `model_id`、`tp_rank`、`kv_group_id` 和存储根目录。
+- 第一次运行已经把对应前缀 block 成功写入外部存储。
+
 ## 当前 PoC 范围
 
 当前 PoC 以 CPU 路径优先，并且按 layer 组织。
@@ -213,9 +283,11 @@ PYTHONPATH=. .venv/bin/python -m unittest tests/v1/kv_connector/unit/test_curvin
 使用前提如下：
 
 - `Curvine` 当前用本地 POSIX 目录或者真实 Curvine FUSE 挂载点来表示。
-- model path 是本地已存在的真实模型目录。
+- model path 可以是本地真实模型目录，也可以先用最小本地配置加 `load_format="dummy"` 做链路验证。
 - 你的 CPU runtime 环境已经可以成功执行 `LLM.generate()`。
 - 两次运行使用相同的 connector 配置和相同的存储根目录。
+- 为了验证“外部 Curvine 命中”而不是“同进程内 prefix cache 命中”，第二次验证必须放在一个全新的 Python 进程里执行。
+- 不要使用 `python - <<'PY'` 这类 heredoc / stdin 方式执行。vLLM 在当前 CPU worker 启动路径下会把主程序识别为 `<stdin>`，导致子进程启动失败。请始终使用一个真实的 `.py` 文件路径执行。
 
 首先，准备一个干净的本地后端路径：
 
@@ -225,37 +297,63 @@ rm -rf "$CURVINE_ROOT"
 mkdir -p "$CURVINE_ROOT"
 ```
 
+推荐先准备一个最小可执行脚本，例如 `/tmp/manual_curvine_llm.py`：
+
+```python
+from vllm import LLM, SamplingParams, TokensPrompt
+from vllm.config import KVTransferConfig
+
+
+MODEL = "/root/codespace/barry/codespace/vllm/tests/v1/kv_connector/unit/fixtures/minimal_opt"
+PROMPT_IDS = list(range(64))
+
+
+def build_llm() -> LLM:
+    return LLM(
+        model=MODEL,
+        load_format="dummy",
+        skip_tokenizer_init=True,
+        dtype="float32",
+        enforce_eager=True,
+        max_model_len=128,
+        distributed_executor_backend="uni",
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="CurvineKVConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "curvine_store_root": "/tmp/curvine-kv-manual",
+                "curvine_model_id": "manual-curvine-test",
+                "curvine_tp_rank": 0,
+                "curvine_kv_group_id": 0,
+            },
+        ),
+    )
+
+
+def main() -> None:
+    llm = build_llm()
+    prompt = TokensPrompt(prompt_token_ids=PROMPT_IDS)
+    outputs = llm.generate(
+        [prompt],
+        SamplingParams(temperature=0.0, max_tokens=1),
+        use_tqdm=False,
+    )
+    out = outputs[0]
+    print("token_ids =", out.outputs[0].token_ids)
+    print("num_cached_tokens =", out.num_cached_tokens)
+
+
+if __name__ == "__main__":
+    main()
+```
+
 然后运行第一个进程，把外部 KV 存储写出来：
 
 ```bash
-PYTHONPATH=. .venv/bin/python - <<'PY'
-from vllm import LLM, SamplingParams
-from vllm.config import KVTransferConfig
-
-MODEL = "/path/to/local/model"
-PROMPT = "Curvine connector manual validation. " * 128
-
-llm = LLM(
-    model=MODEL,
-    device="cpu",
-    dtype="float32",
-    enforce_eager=True,
-    max_model_len=1024,
-    kv_transfer_config=KVTransferConfig(
-        kv_connector="CurvineKVConnector",
-        kv_role="kv_both",
-        kv_connector_extra_config={
-            "curvine_store_root": "/tmp/curvine-kv-manual",
-            "curvine_model_id": "manual-curvine-test",
-            "curvine_tp_rank": 0,
-            "curvine_kv_group_id": 0,
-        },
-    ),
-)
-
-outputs = llm.generate([PROMPT], SamplingParams(temperature=0.0, max_tokens=1))
-print(outputs[0].outputs[0].text)
-PY
+VLLM_TARGET_DEVICE=cpu \
+VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+PYTHONPATH=. \
+.venv/bin/python /tmp/manual_curvine_llm.py
 ```
 
 确认外部 KV 对象已经落盘：
@@ -264,49 +362,146 @@ PY
 rg --files "$CURVINE_ROOT" | rg '\.kvblk$'
 ```
 
-然后在一个新的进程里，用同样的 prompt 和同样的 connector 配置再次运行：
+然后在一个新的进程里，用同样的脚本和同样的 connector 配置再次运行：
 
 ```bash
-PYTHONPATH=. .venv/bin/python - <<'PY'
-from vllm import LLM, SamplingParams
-from vllm.config import KVTransferConfig
-
-MODEL = "/path/to/local/model"
-PROMPT = "Curvine connector manual validation. " * 128
-
-llm = LLM(
-    model=MODEL,
-    device="cpu",
-    dtype="float32",
-    enforce_eager=True,
-    max_model_len=1024,
-    kv_transfer_config=KVTransferConfig(
-        kv_connector="CurvineKVConnector",
-        kv_role="kv_both",
-        kv_connector_extra_config={
-            "curvine_store_root": "/tmp/curvine-kv-manual",
-            "curvine_model_id": "manual-curvine-test",
-            "curvine_tp_rank": 0,
-            "curvine_kv_group_id": 0,
-        },
-    ),
-)
-
-outputs = llm.generate([PROMPT], SamplingParams(temperature=0.0, max_tokens=1))
-print(outputs[0].outputs[0].text)
-PY
+VLLM_TARGET_DEVICE=cpu \
+VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+PYTHONPATH=. \
+.venv/bin/python /tmp/manual_curvine_llm.py
 ```
 
 这个手动场景里建议确认以下几点：
 
 - 第一次运行后，会在配置的根目录下生成 `*.kvblk` 文件。
 - 第二次运行使用同一份本地 Curvine 路径，并且在相同 prompt 形状下成功完成。
+- 第一轮运行的 `num_cached_tokens` 预期是 `0` 或接近 `0`。
+- 第二轮运行如果真正命中了外部 Curvine 前缀，`num_cached_tokens` 应该明显大于 `0`。
 - connector 配置始终限制在 Curvine 这条路径内部，不需要引入无关的共享 connector 基础设施改动。
+
+如果你已经有真实本地模型目录，也可以把上面的示例替换成真实模型路径，并去掉：
+
+- `load_format="dummy"`
+- `skip_tokenizer_init=True`
+
+同时把 `TokensPrompt(prompt_token_ids=...)` 替换成普通文本 prompt。判断命中的标准不变。
+
+### 如何判断“真的命中了 Curvine”
+
+当前推荐按下面三个层次来判断：
+
+#### 第一层：文件侧证据
+
+- 第一轮运行后，外部路径下出现了 `*.kvblk` 文件。
+- 这些文件路径中包含预期的 `model_id`、`tp_rank` 和 `kv_group_id` 隔离目录。
+
+#### 第二层：请求结果证据
+
+- 第二轮在“全新进程”里运行相同 prompt。
+- `outputs[0].num_cached_tokens > 0`。
+- 因为是全新进程，本地内存中的 prefix cache 不会继承下来，所以这时的 cached tokens 可以视为外部 KV 命中的直接证据。
+
+#### 第三层：A/B 对照证据
+
+如果你想更有把握，可以做一个最小 A/B 对照：
+
+1. 使用空目录作为 `CURVINE_ROOT` 跑一次，记录 `num_cached_tokens`。
+2. 使用已经有 `kvblk` 文件的目录再次跑，记录 `num_cached_tokens`。
+3. 两次配置、模型、prompt 保持完全一致。
+
+预期结果：
+
+- 空目录场景下，`num_cached_tokens` 应该是 `0` 或明显更低。
+- 已有外部 KV 文件的场景下，`num_cached_tokens` 应该明显更高。
+
+### 如果你用的是 `vllm serve`
+
+如果后续不是用离线 `LLM.generate()`，而是跑在线服务，也可以结合指标来观察外部命中。
+
+当前 vLLM 指标里已经有：
+
+- `vllm:external_prefix_cache_queries`
+- `vllm:external_prefix_cache_hits`
+
+它们分别表示：
+
+- 外部 KV connector 查询过多少 prompt token
+- 外部 KV connector 实际命中了多少 cached token
+
+因此在 `vllm serve` 场景下，你可以：
+
+1. 先启动服务，并打开 Curvine connector 配置。
+2. 发送第一轮请求，生成并写入外部 KV。
+3. 重启服务进程，避免把进程内 prefix cache 和外部命中混在一起。
+4. 发送相同前缀的第二轮请求。
+5. 查看 `/metrics` 中的 `vllm:external_prefix_cache_hits` 是否增长。
+
+对于当前 PoC，这是一种比单纯看响应时间更可靠的方式。
 
 当前限制：
 
 - 这条手动 `LLM.generate()` 路径仍然受下面提到的 CPU runtime 和 custom-op 环境约束。
 - 如果环境缺少必需的 CPU extension，可能 connector 逻辑本身已经正确，但完整 runtime 路径仍然会失败。
+
+### 常见失败与排查方法
+
+如果你在手动验证中遇到下面这些报错：
+
+- `ImportError('libcudart.so.12: cannot open shared object file')`
+- `torch.ops._C.compute_slot_mapping_kernel_impl` 不存在
+
+那说明当前失败点已经不是 Curvine 路径或 connector 配置，而是 vLLM 的 CPU build / custom-op 环境。
+
+推荐排查顺序如下：
+
+1. 先卸载现有的 `vllm`
+2. 用 CPU 目标重新做源码 editable 安装
+3. 安装时不要继续依赖预编译 CPU wheel
+4. 安装完成后先验证 `vllm._C` 与 `compute_slot_mapping_kernel_impl` 是否可用
+5. 只有这一步通过后，再回到 Curvine 手动验证
+
+推荐命令：
+
+```bash
+cd /root/codespace/barry/codespace/vllm
+
+VLLM_TARGET_DEVICE=cpu /root/.local/bin/uv pip uninstall -y vllm
+
+VLLM_TARGET_DEVICE=cpu /root/.local/bin/uv pip install -e . --torch-backend=auto --no-build-isolation
+```
+
+安装完成后，先做环境自检：
+
+```bash
+VLLM_TARGET_DEVICE=cpu PYTHONPATH=. .venv/bin/python - <<'PY'
+import torch
+import vllm
+from vllm.platforms import current_platform
+from importlib.metadata import version
+
+print("vllm_version =", version("vllm"))
+print("current_platform =", type(current_platform).__name__, current_platform.device_type)
+
+try:
+    import vllm._C
+    print("import vllm._C = ok")
+except Exception as e:
+    print("import vllm._C = failed:", repr(e))
+
+print(
+    "has compute_slot_mapping_kernel_impl =",
+    hasattr(torch.ops._C, "compute_slot_mapping_kernel_impl"),
+)
+PY
+```
+
+预期至少要满足：
+
+- `current_platform = CpuPlatform cpu`
+- `import vllm._C = ok`
+- `has compute_slot_mapping_kernel_impl = True`
+
+只要第三条还是 `False`，就不要继续判断 Curvine 是否命中，因为真实推理路径还会在 CPU custom op 处失败。
 
 ## 环境说明
 
@@ -343,9 +538,11 @@ pytest
 
 最近一次环境排查得到的结论是：
 
-- 使用预编译的 CPU 风格 editable install，已经可以启动 CPU engine、加载模型并进入执行阶段。
-- 但 runtime 路径仍然缺少一些已编译 custom ops，例如 `torch.ops._C.compute_slot_mapping_kernel_impl`。
-- 如果切换成完整源码 CPU 构建，则还要求 Python 环境使用 CPU 版 PyTorch，并通过非隔离的构建路径成功编译 vLLM 的 CPU 自定义扩展。
+- 使用普通本地目录代替 Curvine FUSE 挂载点，在 connector 配置层面是可行的，`CurvineKVConnector` 也可以被正常创建。
+- 使用 heredoc / stdin 方式执行手动验证脚本并不可行，因为 worker 启动时会把主程序识别为 `<stdin>` 并启动失败。
+- 改为真实 `.py` 文件入口后，vLLM 已经可以进入 engine 初始化、worker 启动、模型 warmup 和 connector 创建阶段。
+- 当前剩余的主要 blocker 仍然是 CPU runtime 所需 custom ops 没有准备完整，例如 `torch.ops._C.compute_slot_mapping_kernel_impl` 缺失，或者 `vllm._C` 仍然带有 `libcudart.so.12` 依赖残留。
+- 因此，当前完整 `LLM.generate()` 的 CPU 手动验证，首先需要一个干净的 CPU 版源码安装环境。
 
 这意味着当前剩余的 CPU 端到端缺口，主要已经是环境和编译扩展问题，而不是 Curvine connector 的 Python 逻辑缺失。
 

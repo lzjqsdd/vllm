@@ -92,7 +92,7 @@ class CurvineKVConnector(KVConnectorBase_V1):
         self._store = PosixCurvineStoreClient(
             root_dir=extra_config.get("curvine_store_root")
             or extra_config.get("shared_storage_path")
-            or "/tmp/curvine-kv",
+            or "/mnt/curvine",
             model_id=extra_config.get("curvine_model_id")
             or vllm_config.model_config.model,
             tp_rank=int(extra_config.get("curvine_tp_rank", 0)),
