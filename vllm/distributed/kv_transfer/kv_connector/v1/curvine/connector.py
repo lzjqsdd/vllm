@@ -219,14 +219,16 @@ class CurvineKVConnector(KVConnectorBase_V1):
         state = self._get_or_create_state(request.request_id)
         state.request = request
 
-        num_full_blocks = self._num_full_blocks(len(request.prompt_token_ids or []))
+        prompt_token_count = len(request.prompt_token_ids or [])
+        max_cache_hit_tokens = max(prompt_token_count - 1, 0)
+        num_full_blocks = self._num_full_blocks(max_cache_hit_tokens)
         if num_full_blocks <= 0:
             state.load_block_keys = []
             return 0, False
 
         start_block = num_computed_tokens // self._block_size
         request_block_keys = self.block_keys_from_hashes(request.block_hashes[:num_full_blocks])
-        exists_results = self._store.batch_exists(request_block_keys)
+        exists_results = self._resolve_scheduler_block_existence(request_block_keys)
         matched_blocks = next(
             (index for index, exists in enumerate(exists_results) if not exists),
             len(exists_results),
@@ -697,6 +699,42 @@ class CurvineKVConnector(KVConnectorBase_V1):
         if layer_name in self._kv_caches:
             return self._layer_scoped_block_key(block_key, layer_name)
         return block_key
+
+    def _resolve_scheduler_block_existence(self, block_keys: list[str]) -> list[bool]:
+        raw_exists = self._store.batch_exists(block_keys)
+        layer_names = self._get_known_layer_names()
+        if not layer_names:
+            return raw_exists
+
+        resolved_exists: list[bool] = []
+        for block_key, block_exists in zip(block_keys, raw_exists):
+            if block_exists:
+                resolved_exists.append(True)
+                continue
+
+            layer_scoped_keys = [
+                self._layer_scoped_block_key(block_key, layer_name)
+                for layer_name in layer_names
+            ]
+            resolved_exists.append(all(self._store.batch_exists(layer_scoped_keys)))
+
+        return resolved_exists
+
+    def _get_known_layer_names(self) -> list[str]:
+        if self._kv_caches:
+            return list(self._kv_caches)
+        if self._kv_cache_config is None:
+            return []
+
+        layer_names: list[str] = []
+        seen: set[str] = set()
+        for kv_cache_group in self._kv_cache_config.kv_cache_groups:
+            for layer_name in kv_cache_group.layer_names:
+                if layer_name in seen:
+                    continue
+                seen.add(layer_name)
+                layer_names.append(layer_name)
+        return layer_names
 
     def _resolve_load_block_key(self, block_key: str, layer_name: str) -> str:
         layer_scoped_key = self._layer_scoped_block_key(block_key, layer_name)

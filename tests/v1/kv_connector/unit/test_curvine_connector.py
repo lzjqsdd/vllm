@@ -23,6 +23,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.curvine.kvblk import (
     deserialize_kvblk,
     serialize_kvblk,
 )
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 
 from .utils import create_request, create_vllm_config
@@ -72,6 +77,30 @@ class TestCurvineKVConnector(unittest.TestCase):
 
     def make_connector(self, role: KVConnectorRole) -> CurvineKVConnector:
         return CurvineKVConnector(self.config, role)
+
+    def make_scheduler_connector_with_layers(
+        self, layer_names: list[str]
+    ) -> CurvineKVConnector:
+        kv_cache_config = KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names,
+                    FullAttentionSpec(
+                        block_size=16,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                )
+            ],
+        )
+        return CurvineKVConnector(
+            self.config,
+            KVConnectorRole.SCHEDULER,
+            kv_cache_config=kv_cache_config,
+        )
 
     def test_factory_registers_curvine_connector(self):
         connector_cls = KVConnectorFactory.get_connector_class_by_name(
@@ -138,6 +167,51 @@ class TestCurvineKVConnector(unittest.TestCase):
             request_metadata.block_keys,
             connector.block_keys_from_hashes(request.block_hashes),
         )
+
+    def test_get_num_new_matched_tokens_recognizes_layer_scoped_block_hits(self):
+        layer_names = ["model.decoder.layers.0.self_attn.attn", "model.decoder.layers.1.self_attn.attn"]
+        connector = self.make_scheduler_connector_with_layers(layer_names)
+        request = create_request(num_tokens=32, block_size=16)
+
+        block_key = connector.block_keys_from_hashes(request.block_hashes)[0]
+        for layer_name in layer_names:
+            connector.store_client.write_block(
+                connector._layer_scoped_block_key(block_key, layer_name),
+                f"{layer_name}-payload".encode(),
+            )
+
+        matched_tokens, is_async = connector.get_num_new_matched_tokens(request, 0)
+
+        self.assertEqual(matched_tokens, 16)
+        self.assertFalse(is_async)
+
+    def test_get_num_new_matched_tokens_requires_all_layer_scoped_blocks(self):
+        layer_names = ["model.decoder.layers.0.self_attn.attn", "model.decoder.layers.1.self_attn.attn"]
+        connector = self.make_scheduler_connector_with_layers(layer_names)
+        request = create_request(num_tokens=32, block_size=16)
+
+        block_key = connector.block_keys_from_hashes(request.block_hashes)[0]
+        connector.store_client.write_block(
+            connector._layer_scoped_block_key(block_key, layer_names[0]),
+            b"layer0-payload",
+        )
+
+        matched_tokens, is_async = connector.get_num_new_matched_tokens(request, 0)
+
+        self.assertEqual(matched_tokens, 0)
+        self.assertFalse(is_async)
+
+    def test_get_num_new_matched_tokens_leaves_last_token_for_recompute(self):
+        connector = self.make_connector(KVConnectorRole.SCHEDULER)
+        request = create_request(num_tokens=16, block_size=16)
+
+        block_key = connector.block_keys_from_hashes(request.block_hashes)[0]
+        connector.store_client.write_block(block_key, b"block-0")
+
+        matched_tokens, is_async = connector.get_num_new_matched_tokens(request, 0)
+
+        self.assertEqual(matched_tokens, 0)
+        self.assertFalse(is_async)
 
     def test_worker_save_and_load_payloads_via_metadata(self):
         worker = self.make_connector(KVConnectorRole.WORKER)

@@ -308,7 +308,7 @@ from vllm.config import KVTransferConfig
 
 
 MODEL = "/path/to/local/minimal_opt_cpu_supported"
-PROMPT_IDS = list(range(128))
+PROMPT_IDS = list(range(256))
 
 
 def build_llm() -> LLM:
@@ -318,7 +318,7 @@ def build_llm() -> LLM:
         skip_tokenizer_init=True,
         dtype="float32",
         enforce_eager=True,
-        max_model_len=256,
+        max_model_len=320,
         distributed_executor_backend="uni",
         kv_transfer_config=KVTransferConfig(
             kv_connector="CurvineKVConnector",
@@ -353,8 +353,14 @@ if __name__ == "__main__":
 其中这个本地 dummy model 至少要满足：
 
 - `hidden_size / num_attention_heads` 落在 CPU_ATTN 支持范围内，例如 `128 / 4 = 32`
-- `max_position_embeddings >= 128`
-- `max_model_len >= 128`
+- `max_position_embeddings >= 512`
+- `max_model_len >= 320`
+
+如果你的目标是验证“第二个全新进程真的命中了外部 Curvine”，而不是只验证“第一次 save 能落盘”，还要额外满足：
+
+- prompt 长度必须大于一个完整 block，而不是刚好等于 block size。
+- scheduler 至少要保留最后一个 token 重新计算 logits，因此不会把整个 prompt 都当成 external hit。
+- 以本工作区实测的 `cache_block_size = 128` 为例，`128` token 只够验证首次 save；要看到第二个全新进程 `num_cached_tokens > 0`，建议直接用 `256` token prompt。
 
 然后运行第一个进程，把外部 KV 存储写出来：
 
@@ -393,11 +399,19 @@ PYTHONPATH=. \
    - 即使固定了 `PYTHONHASHSEED=0`，第二个新进程的 scheduler 仍然生成的是 `save` 而不是 `load`；
    - 进一步排查确认：当前 Curvine connector 的 save 路径使用了 layer-scoped key，而 scheduler 的存在性检查仍然查 raw block key，导致磁盘文件已经存在，第二个新进程仍判断“未命中”。
 
+6. 修复 Curvine connector 的 key 一致性问题，并补上“外部命中不能覆盖最后一个 token”的边界后，又做了一轮真实两进程复测：
+   - 继续固定 `PYTHONHASHSEED=0`；
+   - 使用 CPU 可执行的本地 dummy model；
+   - prompt 提到 `256` token，`max_model_len` 提到 `320`；
+   - 第一轮运行 `num_cached_tokens = 0`，并再次确认外部目录中生成了 `*.kvblk`；
+   - 第二个全新进程运行相同 prompt 时，`num_cached_tokens = 128`，说明跨进程 Curvine 外部命中已经真实打通。
+
 因此，本工作区到 2026-04-17 的真实结论是：
 
 - CPU 运行环境问题已经定位并修通；
 - 真实 save 路径已经打通，能够落盘 `*.kvblk`；
-- 真实跨进程 load 命中当前仍未打通，剩余问题是 Curvine connector 自身的 key 一致性 bug，而不是环境问题。
+- 真实跨进程 load 命中也已经在本工作区复测通过；
+- 剩余需要注意的是：真实验证必须同时满足 CPU 环境、可执行模型配置、固定 `PYTHONHASHSEED` 以及“prompt 长度要足够覆盖至少一个可复用 block”这几个前提。
 
 确认外部 KV 对象已经落盘：
 
@@ -423,7 +437,12 @@ PYTHONPATH=. \
 - 第二轮运行如果真正命中了外部 Curvine 前缀，`num_cached_tokens` 应该明显大于 `0`。
 - connector 配置始终限制在 Curvine 这条路径内部，不需要引入无关的共享 connector 基础设施改动。
 
-注意：截至当前工作区实测，前四条都已经验证过，但“第二轮外部命中”这一条还会被当前 Curvine connector 的 key 一致性问题挡住。也就是说，现在你可以把“首次真实 save 是否成功”与“跨进程真实 load 是否成功”拆成两个阶段分别判断，不要把它们混成一个问题。
+本工作区修复后的真实复测结果是：
+
+- 第一次运行：`num_cached_tokens = 0`
+- 第二次全新进程运行：`num_cached_tokens = 128`
+
+也就是说，这一节现在不再只是“排障记录”，而是已经完成了真实跨进程命中验证。
 
 如果你已经有真实本地模型目录，也可以把上面的示例替换成真实模型路径，并去掉：
 
