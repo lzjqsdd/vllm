@@ -581,6 +581,34 @@ VLLM_TARGET_DEVICE=cpu UV_TORCH_BACKEND=cpu \
 uv pip install --python .venv/bin/python -e . --no-build-isolation
 ```
 
+如果你打算直接基于 `docker/Dockerfile.cpu` 做容器化验证，也需要注意两个额外前提：
+
+1. `docker/Dockerfile.cpu` 使用了 `RUN --mount=...`，所以必须用 BuildKit / `docker buildx build`，不能退回 legacy `docker build`。
+2. 在当前这台机器上，容器内直接访问外部 HTTPS 站点时会报 `curl: (60) SSL certificate problem: unable to get local issuer certificate`，因此构建时需要把宿主机可用的 CA bundle 作为 secret 注入进去。
+
+当前 `docker/Dockerfile.cpu` 已经兼容这个场景：
+
+- 基础镜像安装 `uv` 的步骤支持可选 `host_ca_bundle` secret；
+- CPU 编译阶段默认 `max_jobs` 已从 `32` 下调到 `8`，避免源码构建时把机器直接打满。
+
+推荐的容器化构建命令如下：
+
+```bash
+docker buildx build \
+  --secret id=host_ca_bundle,src=/etc/ssl/certs/ca-certificates.crt \
+  --build-arg max_jobs=4 \
+  --load \
+  --tag vllm-curvine-cpu \
+  --target vllm-openai \
+  -f docker/Dockerfile.cpu .
+```
+
+说明：
+
+- 如果你的环境里容器本身就能正常校验证书链，`--secret id=host_ca_bundle,...` 可以省略。
+- 如果机器负载仍然偏高，可以继续把 `max_jobs` 从 `4` 再往下调。
+- 当前这一步记录的是“容器镜像构建前提和排障结论”；完整的 `/curvine-fuse` 容器内两进程实测，建议在镜像稳定构建完成后再继续执行。
+
 环境自检建议写成一个真实 `.py` 文件再执行，避免再次踩 `<stdin>` 启动路径的问题。例如：
 
 ```python
