@@ -377,34 +377,29 @@ PYTHONPATH=. \
 已在当前工作区按上面的真实 `.py` 文件入口做了多轮实际排查和实测，结论按时间顺序如下：
 
 1. 第一轮失败点不是 Curvine 本身，而是 CPU runtime 环境：
-   - `LLM.generate()` 已经成功进入 engine 初始化、worker 启动、模型 warmup 和 `CurvineKVConnector` 创建阶段。
-   - 随后在 CPU runtime 的 slot mapping custom op 处失败，报错为 `AttributeError: '_OpNamespace' '_C' object has no attribute 'compute_slot_mapping_kernel_impl'`。
-   - 这时 `hasattr(torch.ops._C, "compute_slot_mapping_kernel_impl")` 返回 `False`，因此第一次实测没有生成 `*.kvblk` 文件。
-
+  - `LLM.generate()` 已经成功进入 engine 初始化、worker 启动、模型 warmup 和 `CurvineKVConnector` 创建阶段。
+  - 随后在 CPU runtime 的 slot mapping custom op 处失败，报错为 `AttributeError: '_OpNamespace' '_C' object has no attribute 'compute_slot_mapping_kernel_impl'`。
+  - 这时 `hasattr(torch.ops._C, "compute_slot_mapping_kernel_impl")` 返回 `False`，因此第一次实测没有生成 `*.kvblk` 文件。
 2. 补齐 CPU custom op 之后，又暴露了第二层环境问题：
-   - vLLM 必须做 CPU 目标的 editable 安装，确保 CPU custom op 和 ISA 对应的扩展都实际编译并注册成功。
-   - `torchvision` / `torchaudio` 也必须使用 CPU 版本，否则会在 runtime 路径里因为错误链接到 CUDA 轮子而失败。
-
+  - vLLM 必须做 CPU 目标的 editable 安装，确保 CPU custom op 和 ISA 对应的扩展都实际编译并注册成功。
+  - `torchvision` / `torchaudio` 也必须使用 CPU 版本，否则会在 runtime 路径里因为错误链接到 CUDA 轮子而失败。
 3. 环境修好后，真实链路第一次还能继续往下走，但又踩到两个“验证配置”问题：
-   - `tests/v1/kv_connector/unit/fixtures/minimal_opt` 这个 fixture 的 `head_dim=16`，不满足 `CPU_ATTN` 支持范围，所以不能直接拿来做真实 CPU 推理验证。
-   - 当前 runtime `cache_block_size` 实测是 `128`，原先 `64` token 的 prompt 凑不出完整 block，因此 `request.block_hashes` 为空，不会产生 save metadata，也不会落盘任何外部 KV。
-
+  - `tests/v1/kv_connector/unit/fixtures/minimal_opt` 这个 fixture 的 `head_dim=16`，不满足 `CPU_ATTN` 支持范围，所以不能直接拿来做真实 CPU 推理验证。
+  - 当前 runtime `cache_block_size` 实测是 `128`，原先 `64` token 的 prompt 凑不出完整 block，因此 `request.block_hashes` 为空，不会产生 save metadata，也不会落盘任何外部 KV。
 4. 把 dummy model 改成 CPU 可执行配置，并把 prompt 提到 `128` token 之后：
-   - scheduler 侧已经能真实生成 `save` metadata；
-   - `request.block_hashes` 实测为 `1`；
-   - 本地 Curvine 目录下真实写出了两份 `*.kvblk` 文件（对应两层 self attention）。
-
+  - scheduler 侧已经能真实生成 `save` metadata；
+  - `request.block_hashes` 实测为 `1`；
+  - 本地 Curvine 目录下真实写出了两份 `*.kvblk` 文件（对应两层 self attention）。
 5. 继续做第二个全新进程验证时，又发现一个当前 PoC 的真实功能问题：
-   - 如果 `PYTHONHASHSEED` 不固定，同一个 prompt 在两个新进程里会生成不同的 block key；
-   - 即使固定了 `PYTHONHASHSEED=0`，第二个新进程的 scheduler 仍然生成的是 `save` 而不是 `load`；
-   - 进一步排查确认：当前 Curvine connector 的 save 路径使用了 layer-scoped key，而 scheduler 的存在性检查仍然查 raw block key，导致磁盘文件已经存在，第二个新进程仍判断“未命中”。
-
+  - 如果 `PYTHONHASHSEED` 不固定，同一个 prompt 在两个新进程里会生成不同的 block key；
+  - 即使固定了 `PYTHONHASHSEED=0`，第二个新进程的 scheduler 仍然生成的是 `save` 而不是 `load`；
+  - 进一步排查确认：当前 Curvine connector 的 save 路径使用了 layer-scoped key，而 scheduler 的存在性检查仍然查 raw block key，导致磁盘文件已经存在，第二个新进程仍判断“未命中”。
 6. 修复 Curvine connector 的 key 一致性问题，并补上“外部命中不能覆盖最后一个 token”的边界后，又做了一轮真实两进程复测：
-   - 继续固定 `PYTHONHASHSEED=0`；
-   - 使用 CPU 可执行的本地 dummy model；
-   - prompt 提到 `256` token，`max_model_len` 提到 `320`；
-   - 第一轮运行 `num_cached_tokens = 0`，并再次确认外部目录中生成了 `*.kvblk`；
-   - 第二个全新进程运行相同 prompt 时，`num_cached_tokens = 128`，说明跨进程 Curvine 外部命中已经真实打通。
+  - 继续固定 `PYTHONHASHSEED=0`；
+  - 使用 CPU 可执行的本地 dummy model；
+  - prompt 提到 `256` token，`max_model_len` 提到 `320`；
+  - 第一轮运行 `num_cached_tokens = 0`，并再次确认外部目录中生成了 `*.kvblk`；
+  - 第二个全新进程运行相同 prompt 时，`num_cached_tokens = 128`，说明跨进程 Curvine 外部命中已经真实打通。
 
 因此，本工作区到 2026-04-17 的真实结论是：
 
@@ -609,6 +604,489 @@ docker buildx build \
 - 如果机器负载仍然偏高，可以继续把 `max_jobs` 从 `4` 再往下调。
 - 当前这一步记录的是“容器镜像构建前提和排障结论”；完整的 `/curvine-fuse` 容器内两进程实测，建议在镜像稳定构建完成后再继续执行。
 
+### 当前机器实测可用的 Docker 测试步骤（2026-04-20）
+
+在当前这台 `linux/arm64` 机器上，已经实际验证过一条更稳的 Docker 路径：
+
+- 不强依赖先把 `docker/Dockerfile.cpu` 整镜像一次性 build 完。
+- 直接启动一个 `ubuntu:22.04` 的 `arm64` 容器，把仓库目录和测试 KV 目录挂进去。
+- 系统包安装走直连；`uv`、PyTorch CPU wheels 和源码构建阶段再走宿主机代理。
+- 仍然使用普通本地目录作为 `curvine_store_root`，不要求真实 Curvine FUSE 挂载点。
+
+这条路径已经在当前工作区实测通过：
+
+- CPU custom op 自检通过；
+- 第一次新进程运行 `num_cached_tokens = 0`；
+- 第二次全新进程运行 `num_cached_tokens = 128`；
+- 宿主机挂载目录下真实生成了 `*.kvblk`。
+
+如果你在当前机器复现，推荐按下面步骤执行。
+
+#### 1. 准备本地测试目录
+
+```bash
+export CURVINE_ROOT=/tmp/curvine-kv-manual
+rm -rf "$CURVINE_ROOT"
+mkdir -p "$CURVINE_ROOT"
+```
+
+#### 2. 启动容器
+
+这里使用 `--network host`，是为了让容器内直接复用宿主机上的 `127.0.0.1:7890` 代理。
+
+```bash
+docker run -d \
+  --platform=linux/arm64 \
+  --network host \
+  --name curvine-e2e \
+  -v "$PWD:/workspace/vllm" \
+  -v "$CURVINE_ROOT:/tmp/curvine-kv-manual" \
+  ubuntu:22.04 \
+  bash -lc 'sleep infinity'
+```
+
+如果你的环境里 `ubuntu:22.04` 默认 tag 指向的是错误架构，或者 `docker.io` 元数据解析不稳定，可以先准备一个可用的 `arm64` `22.04` 本地 tag，再替换上面命令里的镜像名。
+
+#### 3. 在容器内安装 CPU 版 vLLM 环境
+
+在当前机器上，下面这组命令已经实测可用：
+
+- `apt-get` 直连；
+- `uv`、PyTorch CPU wheels 和源码构建使用宿主机代理；
+- 构建并行度使用半核，即 `MAX_JOBS=32`。
+
+```bash
+docker exec curvine-e2e bash -lc '
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+apt-get update -y
+apt-get install -y --no-install-recommends \
+  sudo ccache git curl wget ca-certificates \
+  gcc-12 g++-12 libtcmalloc-minimal4 libnuma-dev \
+  ffmpeg libsm6 libxext6 libgl1 jq lsof make xz-utils
+
+update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 \
+  --slave /usr/bin/g++ g++ /usr/bin/g++-12
+
+export http_proxy=http://127.0.0.1:7890
+export https_proxy=http://127.0.0.1:7890
+export HTTP_PROXY=http://127.0.0.1:7890
+export HTTPS_PROXY=http://127.0.0.1:7890
+
+if [ ! -x /root/.local/bin/uv ]; then
+  curl -fsSL --retry 5 --retry-all-errors \
+    https://astral.sh/uv/install.sh -o /tmp/uv-installer.sh
+  sh /tmp/uv-installer.sh
+fi
+
+export PATH=/root/.local/bin:$PATH
+export UV_HTTP_TIMEOUT=500
+export UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu
+export UV_INDEX_STRATEGY=unsafe-best-match
+export UV_LINK_MODE=copy
+
+cd /workspace/vllm
+rm -rf /opt/curvine-venv .deps vllm.egg-info
+
+uv venv --python 3.12 --seed /opt/curvine-venv
+uv pip install --python /opt/curvine-venv/bin/python \
+  setuptools==77.0.3 \
+  "cmake>=3.26.1" \
+  ninja \
+  "packaging>=24.2" \
+  "setuptools-scm>=8.0" \
+  wheel \
+  jinja2 \
+  -r requirements/cpu.txt
+
+VLLM_TARGET_DEVICE=cpu UV_TORCH_BACKEND=cpu MAX_JOBS=32 \
+uv pip install --python /opt/curvine-venv/bin/python \
+  -e . --no-build-isolation
+'
+```
+
+#### 4. 先做 CPU custom op 自检
+
+```bash
+docker exec curvine-e2e bash -lc '
+/opt/curvine-venv/bin/python - <<'"'"'PY'"'"'
+from importlib.metadata import version
+
+import torch
+import vllm
+from vllm.platforms import current_platform
+
+print("vllm_version =", version("vllm"))
+print("current_platform =", type(current_platform).__name__, current_platform.device_type)
+
+try:
+    import vllm._C
+    print("import vllm._C = ok")
+except Exception as err:
+    print("import vllm._C = failed:", repr(err))
+
+for module_name in ("vllm._C_AVX2", "vllm._C_AVX512"):
+    try:
+        __import__(module_name)
+        print(f"import {module_name} = ok")
+    except Exception as err:
+        print(f"import {module_name} = failed:", repr(err))
+
+print(
+    "has compute_slot_mapping_kernel_impl =",
+    hasattr(torch.ops._C, "compute_slot_mapping_kernel_impl"),
+)
+PY
+'
+```
+
+当前机器的实测结果是：
+
+- `current_platform = CpuPlatform cpu`
+- `import vllm._C = ok`
+- `has compute_slot_mapping_kernel_impl = True`
+
+当前这台 `arm64` 机器上没有额外产出 `vllm._C_AVX2` / `vllm._C_AVX512` 模块；只要 `vllm._C` 与 `compute_slot_mapping_kernel_impl` 正常，就可以继续做 Curvine 验证。
+
+#### 5. 在容器内准备最小 dummy model 和手动验证脚本
+
+```bash
+docker exec curvine-e2e bash -lc '
+mkdir -p /tmp/minimal_opt_cpu_supported
+cat > /tmp/minimal_opt_cpu_supported/config.json <<'"'"'EOF'"'"'
+{
+  "_name_or_path": "minimal-opt-cpu-supported",
+  "architectures": ["OPTForCausalLM"],
+  "bos_token_id": 0,
+  "do_layer_norm_before": true,
+  "dropout": 0.0,
+  "enable_bias": true,
+  "eos_token_id": 2,
+  "ffn_dim": 512,
+  "hidden_size": 128,
+  "init_std": 0.02,
+  "layerdrop": 0.0,
+  "max_position_embeddings": 512,
+  "model_type": "opt",
+  "num_attention_heads": 4,
+  "num_hidden_layers": 2,
+  "torch_dtype": "float32",
+  "vocab_size": 50272,
+  "word_embed_proj_dim": 128
+}
+EOF
+
+cat > /tmp/manual_curvine_llm_e2e.py <<'"'"'EOF'"'"'
+from vllm import LLM, SamplingParams, TokensPrompt
+from vllm.config import KVTransferConfig
+
+MODEL = "/tmp/minimal_opt_cpu_supported"
+PROMPT_IDS = list(range(256))
+
+
+def build_llm() -> LLM:
+    return LLM(
+        model=MODEL,
+        load_format="dummy",
+        skip_tokenizer_init=True,
+        dtype="float32",
+        enforce_eager=True,
+        max_model_len=320,
+        distributed_executor_backend="uni",
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="CurvineKVConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "curvine_store_root": "/tmp/curvine-kv-manual",
+                "curvine_model_id": "manual-curvine-test",
+                "curvine_tp_rank": 0,
+                "curvine_kv_group_id": 0,
+            },
+        ),
+    )
+
+
+def main() -> None:
+    llm = build_llm()
+    prompt = TokensPrompt(prompt_token_ids=PROMPT_IDS)
+    outputs = llm.generate(
+        [prompt],
+        SamplingParams(temperature=0.0, max_tokens=1),
+        use_tqdm=False,
+    )
+    out = outputs[0]
+    print("token_ids =", out.outputs[0].token_ids)
+    print("num_cached_tokens =", out.num_cached_tokens)
+
+
+if __name__ == "__main__":
+    main()
+EOF
+'
+```
+
+这里有几个关键点：
+
+- `hidden_size=128, num_attention_heads=4`，因此 `head_dim=32`，满足 CPU_ATTN 支持范围；
+- `PROMPT_IDS = list(range(256))`，确保至少覆盖一个可复用 block；
+- `max_model_len=320`，避免 prompt 长度接近上限时再触发别的约束。
+
+#### 为什么这里的 dummy model 仍然能验证 KV cache 命中
+
+这里的 `minimal-opt-cpu-supported` 不是一个真实预训练模型，它的作用是提供一份“结构可执行”的最小模型配置，并配合 `load_format="dummy"` 跑通真实的 runtime 链路。
+
+要点是：
+
+- 模型结构是真的：layer 数、attention head 数、head size、KV cache 形状都是真实参与运行时计算的；
+- 权重是假的：因此它不适合用来判断生成内容质量，也不代表真实业务推理效果；
+- 推理路径是真的：`LLM.generate()`、prefill、block hash 生成、scheduler、KV cache 分块、Curvine save/load、第二个新进程复用，这些步骤都会真实执行。
+
+因此，这里验证的目标不是“模型回答是否正确”，而是下面这条运行时链路是否真实发生：
+
+```mermaid
+flowchart TD
+    A[Dummy model config] --> B[LLM.generate]
+    B --> C[Real prefill path runs]
+    C --> D[KV cache blocks created]
+    D --> E[Curvine writes kvblk files]
+    E --> F[New Python process starts]
+    F --> G[Curvine loads external KV blocks]
+    G --> H[num_cached_tokens > 0]
+```
+
+
+
+换句话说：
+
+- 它不能证明真实模型语义正确；
+- 但它可以证明推理过程中外部 KV cache 真的被保存，并且在第二个全新进程里被重新读回。
+
+当前机器上，这一点已经通过下面两类证据得到确认：
+
+- 第一轮运行后，宿主机挂载目录下真实生成了 `*.kvblk`；
+- 第二轮全新进程运行时，`num_cached_tokens = 128`。
+
+#### 6. 跑第一轮新进程
+
+```bash
+docker exec curvine-e2e bash -lc '
+rm -rf /tmp/curvine-kv-manual/*
+PYTHONHASHSEED=0 \
+VLLM_TARGET_DEVICE=cpu \
+VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+/opt/curvine-venv/bin/python -u /tmp/manual_curvine_llm_e2e.py \
+  > /tmp/curvine-kv-manual/run1.log 2>&1
+'
+```
+
+确认第一轮结果：
+
+```bash
+sed -n "1,120p" "$CURVINE_ROOT/run1.log"
+rg --files "$CURVINE_ROOT" | rg '\.kvblk$'
+```
+
+当前机器实测结果：
+
+- 第一轮 `num_cached_tokens = 0`
+- 外部目录下生成了 4 个 `*.kvblk`
+
+#### 7. 跑第二轮全新进程
+
+```bash
+docker exec curvine-e2e bash -lc '
+PYTHONHASHSEED=0 \
+VLLM_TARGET_DEVICE=cpu \
+VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+/opt/curvine-venv/bin/python -u /tmp/manual_curvine_llm_e2e.py \
+  > /tmp/curvine-kv-manual/run2.log 2>&1
+'
+```
+
+然后看第二轮结果：
+
+```bash
+sed -n "1,120p" "$CURVINE_ROOT/run2.log"
+```
+
+当前机器实测结果是：
+
+- 第二轮 `num_cached_tokens = 128`
+
+这说明第二轮全新进程已经真实命中了外部 Curvine KV，而不是命中了同进程内的 prefix cache。
+
+#### 8. 清理容器
+
+```bash
+docker rm -f curvine-e2e
+```
+
+如果只是想重复试验，也可以保留容器和 `/opt/curvine-venv`，只重新清理 `$CURVINE_ROOT` 后继续跑第 6、7 步。
+
+#### 9. 用真实模型 `facebook/opt-125m` 做同样的验证
+
+如果你想把上面的 dummy model 链路，换成一个真实预训练模型，当前工作区已经实测通过 `facebook/opt-125m`。
+
+推荐仍然沿用同一个容器和同一个挂载目录，只把：
+
+- `model` 改成 `facebook/opt-125m`
+- `curvine_model_id` 改成另一个独立值
+- 日志文件名改成单独的 `run1-real.log` / `run2-real.log`
+
+先在容器内准备真实模型版脚本：
+
+```bash
+docker exec curvine-e2e bash -lc '
+cat > /tmp/manual_curvine_llm_real_opt125m.py <<'"'"'EOF'"'"'
+from vllm import LLM, SamplingParams, TokensPrompt
+from vllm.config import KVTransferConfig
+
+MODEL = "facebook/opt-125m"
+PROMPT_IDS = list(range(256))
+
+
+def build_llm() -> LLM:
+    return LLM(
+        model=MODEL,
+        skip_tokenizer_init=True,
+        dtype="float32",
+        enforce_eager=True,
+        max_model_len=320,
+        distributed_executor_backend="uni",
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="CurvineKVConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "curvine_store_root": "/tmp/curvine-kv-manual",
+                "curvine_model_id": "real-opt-125m-test",
+                "curvine_tp_rank": 0,
+                "curvine_kv_group_id": 0,
+            },
+        ),
+    )
+
+
+def main() -> None:
+    llm = build_llm()
+    prompt = TokensPrompt(prompt_token_ids=PROMPT_IDS)
+    outputs = llm.generate(
+        [prompt],
+        SamplingParams(temperature=0.0, max_tokens=1),
+        use_tqdm=False,
+    )
+    out = outputs[0]
+    print("token_ids =", out.outputs[0].token_ids)
+    print("num_cached_tokens =", out.num_cached_tokens)
+
+
+if __name__ == "__main__":
+    main()
+EOF
+'
+```
+
+然后跑第一轮：
+
+```bash
+docker exec curvine-e2e bash -lc '
+export http_proxy=http://127.0.0.1:7890
+export https_proxy=http://127.0.0.1:7890
+export HTTP_PROXY=http://127.0.0.1:7890
+export HTTPS_PROXY=http://127.0.0.1:7890
+export HF_HUB_DISABLE_TELEMETRY=1
+
+rm -rf /tmp/curvine-kv-manual/*
+PYTHONHASHSEED=0 \
+VLLM_TARGET_DEVICE=cpu \
+VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+/opt/curvine-venv/bin/python -u /tmp/manual_curvine_llm_real_opt125m.py \
+  > /tmp/curvine-kv-manual/run1-real.log 2>&1
+'
+```
+
+看第一轮结果：
+
+```bash
+sed -n "1,160p" "$CURVINE_ROOT/run1-real.log"
+rg --files "$CURVINE_ROOT" | rg '\.kvblk$'
+```
+
+当前机器实测结果：
+
+- 第一轮成功下载并加载了 `facebook/opt-125m`
+- 第一轮 `num_cached_tokens = 0`
+- 外部目录下真实生成了多层 `*.kvblk`
+
+然后跑第二轮全新进程：
+
+```bash
+docker exec curvine-e2e bash -lc '
+export http_proxy=http://127.0.0.1:7890
+export https_proxy=http://127.0.0.1:7890
+export HTTP_PROXY=http://127.0.0.1:7890
+export HTTPS_PROXY=http://127.0.0.1:7890
+export HF_HUB_DISABLE_TELEMETRY=1
+
+PYTHONHASHSEED=0 \
+VLLM_TARGET_DEVICE=cpu \
+VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+/opt/curvine-venv/bin/python -u /tmp/manual_curvine_llm_real_opt125m.py \
+  > /tmp/curvine-kv-manual/run2-real.log 2>&1
+'
+```
+
+再看第二轮结果：
+
+```bash
+sed -n "1,160p" "$CURVINE_ROOT/run2-real.log"
+```
+
+当前机器实测结果：
+
+- 第二轮 `num_cached_tokens = 128`
+
+这说明在真实模型 `facebook/opt-125m` 上，Curvine 的跨进程外部 KV 复用也已经真实命中。
+
+#### 10. 真实模型是不是每次都要重新下载
+
+不一定。
+
+默认情况下，Hugging Face 模型会下载到容器内用户目录下的缓存，例如：
+
+- `~/.cache/huggingface`
+
+所以行为是：
+
+1. 如果你保留同一个容器，后续重复跑 `facebook/opt-125m`，通常不需要再次完整下载。
+2. 如果你删除容器再重建，而没有把 Hugging Face 缓存目录挂到宿主机，那新容器里还是会重新下载。
+3. 如果你想让不同容器之间也复用下载结果，建议显式挂载 Hugging Face 缓存目录。
+
+例如：
+
+```bash
+mkdir -p /tmp/hf-cache
+
+docker run -d \
+  --platform=linux/arm64 \
+  --network host \
+  --name curvine-e2e \
+  -v "$PWD:/workspace/vllm" \
+  -v "$CURVINE_ROOT:/tmp/curvine-kv-manual" \
+  -v /tmp/hf-cache:/root/.cache/huggingface \
+  ubuntu:22.04 \
+  bash -lc 'sleep infinity'
+```
+
+或者在容器里显式指定：
+
+```bash
+export HF_HOME=/root/.cache/huggingface
+```
+
+这样即使你反复销毁和重建测试容器，只要宿主机的 `/tmp/hf-cache` 还在，`facebook/opt-125m` 就不需要每次重新下载。
+
 环境自检建议写成一个真实 `.py` 文件再执行，避免再次踩 `<stdin>` 启动路径的问题。例如：
 
 ```python
@@ -709,17 +1187,19 @@ pytest
 
 ### 2. 完整 `LLM.generate()` 的 CPU 端到端验证
 
-这一层在当前工作区里还没有完全闭环。
+这一层现在已经可以在当前工作区内闭环。
 
 最近一次环境排查得到的结论是：
 
 - 使用普通本地目录代替 Curvine FUSE 挂载点，在 connector 配置层面是可行的，`CurvineKVConnector` 也可以被正常创建。
 - 使用 heredoc / stdin 方式执行手动验证脚本并不可行，因为 worker 启动时会把主程序识别为 `<stdin>` 并启动失败。
 - 改为真实 `.py` 文件入口后，vLLM 已经可以进入 engine 初始化、worker 启动、模型 warmup 和 connector 创建阶段。
-- 当前剩余的主要 blocker 仍然是 CPU runtime 所需 custom ops 没有准备完整，例如 `torch.ops._C.compute_slot_mapping_kernel_impl` 缺失，或者 `vllm._C` 仍然带有 `libcudart.so.12` 依赖残留。
-- 因此，当前完整 `LLM.generate()` 的 CPU 手动验证，首先需要一个干净的 CPU 版源码安装环境。
+- 当前工作区已经补齐 CPU runtime 所需 custom ops，并在容器内确认 `torch.ops._C.compute_slot_mapping_kernel_impl = True`。
+- 当前工作区已经在 Docker 容器内完成两进程实测：第一轮 `num_cached_tokens = 0`，第二轮全新进程 `num_cached_tokens = 128`。
+- 当前工作区也已经在真实模型 `facebook/opt-125m` 上完成同样的两进程容器实测：第一轮 `num_cached_tokens = 0`，第二轮全新进程 `num_cached_tokens = 128`。
+- 当前工作区也已经在宿主机挂载目录下确认真实 `*.kvblk` 文件落盘，因此当前剩余关注点已经不再是“Curvine backend 是否可用”，而是后续如何把这条路径整理成更稳定的开发和 CI 入口。
 
-这意味着当前剩余的 CPU 端到端缺口，主要已经是环境和编译扩展问题，而不是 Curvine connector 的 Python 逻辑缺失。
+这意味着当前 CPU 端到端路径已经不再卡在环境和编译扩展问题上；当前 PoC 的主要剩余工作，已经转向让这条实测路径更容易重复执行，以及继续扩展到更多 rank 和更真实的运行场景。
 
 ## 风险
 
@@ -743,7 +1223,7 @@ pytest
 当前建议的执行顺序如下：
 
 1. 完成 CPU 路径上的 save 侧 partial-token gather。
-2. 通过修复 CPU build 和 custom op 环境，打通完整的 CPU `LLM.generate()` 端到端路径。
+2. 把已经跑通的 Docker CPU `LLM.generate()` 验证路径整理成更稳定的复现入口。
 3. 用真实请求跑通真正的 Curvine-backed CPU PoC。
 4. 将 worker 路径从 CPU-only 语义扩展到真正的 GPU gather / scatter。
 5. 验证多 rank 与压测场景。

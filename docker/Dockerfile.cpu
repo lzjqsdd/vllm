@@ -19,8 +19,10 @@
 #   VLLM_CPU_ARM_BF16=false (default)|true (for cross-compilation)
 #
 
+ARG BASE_IMAGE=ubuntu:22.04
+
 ######################### COMMON BASE IMAGE #########################
-FROM ubuntu:22.04 AS base-common
+FROM ${BASE_IMAGE} AS base-common
 
 WORKDIR /workspace
 
@@ -36,7 +38,20 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     gcc-12 g++-12 libtcmalloc-minimal4 libnuma-dev ffmpeg libsm6 libxext6 libgl1 jq lsof make xz-utils \
     && if [ -f /run/secrets/host_ca_bundle ]; then cp /run/secrets/host_ca_bundle /etc/ssl/certs/ca-certificates.crt; fi \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 --slave /usr/bin/g++ g++ /usr/bin/g++-12 \
-    && curl -LsSf https://astral.sh/uv/install.sh | sh
+    && for attempt in 1 2 3; do \
+        curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 300 \
+            https://astral.sh/uv/install.sh -o /tmp/uv-installer.sh \
+        && sh /tmp/uv-installer.sh \
+        && /root/.local/bin/uv --version \
+        && rm -f /tmp/uv-installer.sh \
+        && break; \
+        if [ "$attempt" -eq 3 ]; then \
+            echo "failed to install uv after ${attempt} attempts" >&2; \
+            exit 1; \
+        fi; \
+        rm -f /tmp/uv-installer.sh; \
+        sleep 5; \
+    done
 
 ENV CC=/usr/bin/gcc-12 CXX=/usr/bin/g++-12
 ENV CCACHE_DIR=/root/.cache/ccache
