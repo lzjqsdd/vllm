@@ -108,6 +108,23 @@ class TestCurvineKVConnector(unittest.TestCase):
         )
         self.assertIs(connector_cls, CurvineKVConnector)
 
+    def test_new_connector_instance_sees_prior_posix_store_writes(self):
+        """Simulates a second process with the same storage root (POSIX layout)."""
+        cfg = create_vllm_config(
+            kv_connector="CurvineKVConnector",
+            kv_connector_extra_config={
+                "curvine_store_root": self.temp_dir.name,
+                "curvine_model_id": "unit-test-model",
+                "curvine_tp_rank": 0,
+                "curvine_kv_group_id": 0,
+            },
+        )
+        first = CurvineKVConnector(cfg, KVConnectorRole.WORKER)
+        first.store_client.write_block("shared-block", b"payload-bytes")
+        second = CurvineKVConnector(cfg, KVConnectorRole.WORKER)
+        self.assertTrue(second.store_client.exists("shared-block"))
+        self.assertEqual(second.store_client.read_block("shared-block"), b"payload-bytes")
+
     def test_get_num_new_matched_tokens_counts_consecutive_block_hits(self):
         connector = self.make_connector(KVConnectorRole.SCHEDULER)
         request = create_request(num_tokens=48, block_size=16)

@@ -24,7 +24,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.curvine.store import (
     BlockNotFoundError,
     CurvineStoreClient,
     CurvineStoreError,
+    CurvineStoreIdentity,
+    NativeCurvineStoreClient,
     PosixCurvineStoreClient,
+    make_curvine_store_client,
 )
 
 __all__ = [
@@ -46,5 +49,8 @@ __all__ = [
     "BlockNotFoundError",
     "CurvineStoreClient",
     "CurvineStoreError",
+    "CurvineStoreIdentity",
+    "NativeCurvineStoreClient",
     "PosixCurvineStoreClient",
+    "make_curvine_store_client",
 ]

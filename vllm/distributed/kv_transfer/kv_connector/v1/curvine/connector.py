@@ -30,7 +30,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.curvine.kvblk import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.curvine.store import (
     BlockNotFoundError,
-    PosixCurvineStoreClient,
+    CurvineStoreClient,
+    make_curvine_store_client,
 )
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
@@ -89,14 +90,9 @@ class CurvineKVConnector(KVConnectorBase_V1):
         super().__init__(vllm_config, role, kv_cache_config)
         extra_config = self._kv_transfer_config.kv_connector_extra_config
         self._block_size = vllm_config.cache_config.block_size
-        self._store = PosixCurvineStoreClient(
-            root_dir=extra_config.get("curvine_store_root")
-            or extra_config.get("shared_storage_path")
-            or "/mnt/curvine",
-            model_id=extra_config.get("curvine_model_id")
-            or vllm_config.model_config.model,
-            tp_rank=int(extra_config.get("curvine_tp_rank", 0)),
-            kv_group_id=int(extra_config.get("curvine_kv_group_id", 0)),
+        self._store = make_curvine_store_client(
+            extra_config,
+            default_model_id=vllm_config.model_config.model,
         )
         self._scheduling_states: dict[str, CurvineSchedulingState] = {}
         self._kv_caches: dict[str, torch.Tensor] = {}
@@ -107,7 +103,7 @@ class CurvineKVConnector(KVConnectorBase_V1):
         ] = {}
 
     @property
-    def store_client(self) -> PosixCurvineStoreClient:
+    def store_client(self) -> CurvineStoreClient:
         return self._store
 
     def block_key_for_hash(self, block_hash: bytes) -> str:
@@ -453,13 +449,14 @@ class CurvineKVConnector(KVConnectorBase_V1):
         num_kv_heads: int = 0,
         head_size: int = 0,
     ) -> bytes:
+        identity = self._store.store_identity
         header = KvblkHeader(
             checksum_type=ChecksumType.CRC32,
             payload_codec=PayloadCodec.RAW,
             block_key_hash=hashlib.md5(block_key.encode("utf-8")).digest(),
             model_id_hash=self._model_id_hash(),
-            tp_rank=self._store._tp_rank,
-            kv_group_id=self._store._kv_group_id,
+            tp_rank=identity.tp_rank,
+            kv_group_id=identity.kv_group_id,
             cache_layout=cache_layout,
             dtype_code=dtype_code,
             block_size_tokens=self._block_size,
@@ -494,7 +491,9 @@ class CurvineKVConnector(KVConnectorBase_V1):
         )
 
     def _model_id_hash(self) -> int:
-        model_digest = hashlib.sha256(self._store._model_id.encode("utf-8")).digest()
+        model_digest = hashlib.sha256(
+            self._store.store_identity.model_id.encode("utf-8")
+        ).digest()
         return int.from_bytes(model_digest[:8], "little", signed=False)
 
     def _tensor_to_bytes(self, tensor: torch.Tensor) -> bytes:
